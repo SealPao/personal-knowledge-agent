@@ -1,0 +1,13 @@
+data/
+work/
+dist/
+build/
+__pycache__/
+*.pyc
+*.sqlite*
+*.pka
+*.exe
+*.traineddata
+.env
+.env.*
+*.spec
