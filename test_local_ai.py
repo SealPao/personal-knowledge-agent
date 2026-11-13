@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -114,9 +115,48 @@ class LocalModelTests(unittest.TestCase):
     def test_builtin_answer_only_accepts_provided_citation_ids(self):
         sources=[{'id':1,'excerpt':'設定在系統選單'}]
         def post(url,headers,payload):
-            return {'choices':[{'message':{'content':'{"answer":"設定在系統選單","citations":[1]}'}}]}
+            return {'choices':[{'message':{'content':'{"answer":"設定在系統選單","citations":[1],"evidence":[{"source_id":1,"quote":"設定在系統選單"}]}'}}]}
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
             text,citations,_=ai_service.answer('設定在哪裡',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
-        self.assertIn('[1]',text); self.assertEqual(citations,sources)
+        self.assertIn('[1]',text); self.assertIn('供核對的來源片段文字',text); self.assertIn('設定在系統選單',text); self.assertEqual(citations,sources)
+    def test_builtin_retries_and_rejects_fabricated_quote(self):
+        sources=[{'id':1,'excerpt':'進入設定頁面'}]; calls=[]
+        def post(url,headers,payload):
+            calls.append(1)
+            return {'choices':[{'message':{'content':'{"answer":"完成","citations":[1],"evidence":[{"source_id":1,"quote":"已執行重置"}]}'}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            with self.assertRaisesRegex(RuntimeError,'來源原文'):
+                ai_service.answer('問題',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertEqual(len(calls),2)
+    def test_quote_must_match_the_corresponding_source(self):
+        sources=[{'id':1,'excerpt':'第一台長按'},{'id':2,'excerpt':'第二台短按'}]
+        raw='{"answer":"操作 [1]","citations":[1],"evidence":[{"source_id":1,"quote":"第二台短按"}]}'
+        with self.assertRaises(ValueError): ai_service._checked_evidence(raw,sources)
+    def test_builtin_retries_then_displays_verified_excerpt(self):
+        sources=[{'id':1,'excerpt':'請長按電源鍵以關機。'}]; calls=[]
+        def post(url,headers,payload):
+            calls.append(1)
+            quote='按一下電源鍵' if len(calls)==1 else '長按電源鍵以關機'
+            content=json.dumps({'answer':'長按電源鍵 [1]','citations':[1],'evidence':[{'source_id':1,'quote':quote}]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,cited,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertEqual(len(calls),2); self.assertIn('長按電源鍵以關機',text); self.assertNotIn('按一下電源鍵',text); self.assertEqual(cited,sources)
+    def test_number_in_source_quote_is_not_treated_as_citation(self):
+        sources=[{'id':1,'excerpt':'原文標記 [99] 為文件編號'}]
+        def post(url,headers,payload):
+            content=json.dumps({'answer':'文件編號見來源 [1]','citations':[1],'evidence':[{'source_id':1,'quote':'原文標記 [99] 為文件編號'}]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,cited,_=ai_service.answer('文件編號',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertIn('[99]',text); self.assertEqual(cited,sources)
+    def test_warns_when_long_press_or_selection_is_omitted(self):
+        sources=[{'id':1,'excerpt':'長按電源鍵，選擇關機。'}]
+        def post(url,headers,payload):
+            content=json.dumps({'answer':'按下電源鍵 [1]','citations':[1],'evidence':[{'source_id':1,'quote':'長按電源鍵，選擇關機。'}]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,_,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertIn('回答可能遺漏',text); self.assertIn('長按',text); self.assertIn('選擇',text)
 
 if __name__=='__main__': unittest.main()
