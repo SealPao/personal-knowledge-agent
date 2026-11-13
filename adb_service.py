@@ -6,9 +6,11 @@ import subprocess
 import sys
 import hashlib
 import io
+import tempfile
 from pathlib import Path
 from PIL import Image
 import core
+import pdf_features
 
 MAX_IMAGE=20*1024*1024
 PNG=b'\x89PNG\r\n\x1a\n'
@@ -58,6 +60,24 @@ def image_info(png):
         if im.format!='PNG' or im.width*im.height>25_000_000 or min(im.size)<1: raise ValueError('裝置截圖無效或過大')
         rgb=im.convert('RGB'); digest=hashlib.sha256(rgb.tobytes()).hexdigest()
         return im.size,digest
+
+def screen_text(png,cache_dir):
+    """Local OCR of a device screenshot, without writing to the device or source."""
+    image_info(png)
+    exe=pdf_features.tesseract_path()
+    if not exe: raise RuntimeError('沒有可用的 Tesseract OCR')
+    data=Path(exe).resolve().parent/'tessdata'
+    langs=[name for name in ('chi_tra','chi_sim','eng') if (data/(name+'.traineddata')).is_file()]
+    if not langs: raise RuntimeError('找不到可用的畫面 OCR 語言資料')
+    cache=Path(cache_dir); cache.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='screen-ocr-',dir=cache) as folder:
+        image=Path(folder)/'screen.png'; image.write_bytes(png)
+        try:
+            result=subprocess.run([exe,str(image),'stdout','-l','+'.join(langs),'--tessdata-dir',str(data),'--psm','6'],capture_output=True,timeout=90,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        except (OSError,subprocess.SubprocessError) as e: raise RuntimeError('畫面 OCR 無法完成：'+str(e)) from None
+        if result.returncode: raise RuntimeError('畫面 OCR 未能辨識')
+        if len(result.stdout)>2_000_000: raise ValueError('畫面 OCR 結果過大')
+        return result.stdout.decode('utf-8','replace').strip()[:4000]
 
 def perform(serial,action,size,expected_digest,runner=subprocess.run):
     """Require fresh screen verification and accept only a restricted input action."""

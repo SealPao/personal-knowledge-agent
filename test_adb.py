@@ -32,6 +32,17 @@ class DeviceTests(unittest.TestCase):
             self.assertEqual({x[-1] for x in calls},{'ro.product.manufacturer','ro.product.model','ro.build.version.release','ro.build.display.id'})
             self.assertTrue(all(x[1:5]==['-s','reader-123','shell','getprop'] for x in calls))
             with self.assertRaises(ValueError): adb_service.device_info('reader;reboot',runner)
+    def test_local_screen_ocr_uses_bundled_languages_and_temporary_copy(self):
+        from unittest.mock import patch
+        root=self.base/'engine'; data=root/'tessdata'; data.mkdir(parents=True); exe=root/'tesseract.exe'; exe.write_bytes(b'test')
+        for name in ('chi_tra','chi_sim','eng'): (data/(name+'.traineddata')).write_bytes(b'test')
+        calls=[]
+        class Result: returncode=0; stdout='裝置設定'.encode('utf-8')
+        def run(args,**kwargs):
+            calls.append(args); self.assertTrue(Path(args[1]).is_file()); return Result()
+        with patch.object(adb_service.pdf_features,'tesseract_path',return_value=str(exe)),patch.object(adb_service.subprocess,'run',side_effect=run):
+            self.assertEqual(adb_service.screen_text(self.png,self.base/'cache'),'裝置設定')
+        self.assertIn('chi_tra+chi_sim+eng',calls[0]); self.assertFalse(Path(calls[0][1]).exists())
     def test_reviewed_note_and_image_survive_backup(self):
         original=(self.source/'manual.txt').read_bytes()
         card=adb_service.save_note(self.db,'閱讀器設定紀錄','第一步開啟裝置的閱讀設定。第二步選擇文字大小。',self.png)
@@ -59,6 +70,8 @@ class DeviceTests(unittest.TestCase):
         def bad(*args): return {'output':[{'type':'message','content':[{'type':'output_text','text':'{"type":"shell","reason":"x","observation":"x"}'}]}]}
         config['network_enabled']=True
         with self.assertRaises(ValueError): device_agent.plan(self.png,'目標',[],config,'key',bad)
+        device_agent.plan(self.png,'查看設定',[],config,'test-key',post,screen_text='裝置設定')
+        self.assertIn('裝置設定',calls[-1][2]['input'][0]['content'][0]['text'])
     def test_action_requires_unchanged_screen_and_valid_coordinates(self):
         size,digest=adb_service.image_info(self.png); calls=[]
         class Result: returncode=0; stdout=self.png

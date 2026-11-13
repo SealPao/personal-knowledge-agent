@@ -73,6 +73,8 @@ class DeviceWindow(tk.Toplevel):
         self.status=tk.StringVar(value='請連接閱讀器、開啟 USB 偵錯並在裝置上授權。'); label(self,textvariable=self.status,fg=MUTED,wraplength=720,justify='left').pack(anchor='w',padx=20,pady=8)
         label(self,'操作目標（AI 將依此觀察畫面）',font=(FONT,10,'bold')).pack(anchor='w',padx=20)
         self.goalvar=tk.StringVar(value=initial_goal[:1000]); tk.Entry(self,textvariable=self.goalvar,font=(FONT,11)).pack(fill='x',padx=20,pady=(3,8),ipady=4)
+        self.screen_ocr=tk.BooleanVar(value=True)
+        tk.Checkbutton(self,text='以本機 OCR 輔助辨識畫面文字（可能有錯字）',variable=self.screen_ocr,bg=WHITE,fg=INK,font=(FONT,9),anchor='w').pack(anchor='w',padx=20)
         label(self,'紀錄標題',font=(FONT,10,'bold')).pack(anchor='w',padx=20)
         self.titlevar=tk.StringVar(value='閱讀器操作紀錄'); tk.Entry(self,textvariable=self.titlevar,font=(FONT,11)).pack(fill='x',padx=20,pady=(3,8),ipady=4)
         label(self,'已確認的操作步驟或觀察',font=(FONT,10,'bold')).pack(anchor='w',padx=20)
@@ -144,7 +146,7 @@ class DeviceWindow(tk.Toplevel):
         if provider=='local' and not config['local_model']: messagebox.showerror('AI 尚未設定','請先設定本地視覺模型。',parent=self); return
         destination='OpenAI（可能產生費用）' if provider=='openai' else '本機視覺模型'
         overlay=show_image(self,self.png,'即將提供 AI 的畫面')
-        approved=messagebox.askyesno('確認傳送畫面',f'開始後會把目標、操作紀錄及每一步截圖傳送到{destination}，畫面可能含私人資料。AI 每一步操作前均須確認；最多 10 步。確定開始嗎？',parent=overlay)
+        approved=messagebox.askyesno('確認傳送畫面',f'開始後會把目標、操作紀錄、每一步截圖及啟用時的畫面 OCR 文字傳送到{destination}，畫面可能含私人資料。AI 每一步操作前均須確認；最多 10 步。確定開始嗎？',parent=overlay)
         overlay.destroy()
         if not approved: return
         self.agent_serial=self.rows[int(selected[0])][0]; self.agent_config=dict(config); self.goal=goal; self.agent_active=True; self.history=[]; self.images=[self.png]; self.session_path=None
@@ -156,16 +158,20 @@ class DeviceWindow(tk.Toplevel):
         if not self.agent_active: return
         if len(self.history)>=10:
             self.agent_active=False; self.note.insert('end','\n已達步數上限，探索未完成。\n'); self.checkpoint(); self.status.set('已達 10 步上限，已保存未完成紀錄。'); return
-        current=self.png; config=self.agent_config; goal=self.goal; history=list(self.history)
+        current=self.png; config=self.agent_config; goal=self.goal; history=list(self.history); use_ocr=self.screen_ocr.get()
         def planner():
             current_config=ai_ui.read_config(self.db.parent/'ai-settings.json')
             if current_config!=config: raise ValueError('AI 設定已變更，已停止')
+            ocr=''; ocr_error=''
+            if use_ocr:
+                try: ocr=adb_service.screen_text(current,self.db.parent/'cache')
+                except Exception: ocr_error='畫面 OCR 無法使用，本次僅使用截圖。'
             key=ai_service.load_key() if config['provider']=='openai' else None; ticket=None
             try:
-                if config['provider']=='openai': ticket=budget.reserve(self.db,goal,[{'id':1,'excerpt':str(history)}],config['openai_model'],min(800,int(config['max_tokens'])),extra_input_tokens=8192)
-                result=device_agent.plan(current,goal,history,config,key)
+                if config['provider']=='openai': ticket=budget.reserve(self.db,goal,[{'id':1,'excerpt':str(history)+'\n'+ocr}],config['openai_model'],min(800,int(config['max_tokens'])),extra_input_tokens=8192)
+                result=device_agent.plan(current,goal,history,config,key,screen_text=ocr)
                 if ticket: budget.finish(self.db,ticket,result[1])
-                return result[0]
+                return result[0],ocr_error
             except Exception:
                 if ticket: budget.uncertain(self.db,ticket)
                 raise
@@ -228,7 +234,10 @@ class DeviceWindow(tk.Toplevel):
                     else:
                         index=rows.index(target); self.list.selection_set(str(index)); self.capture_serial=target[0]; self.png=png
                         self.start_agent()
-                elif kind=='plan': self.apply_plan(value)
+                elif kind=='plan':
+                    item,ocr_error=value
+                    if ocr_error: self.note.insert('end','\n'+ocr_error+'\n')
+                    self.apply_plan(item)
                 elif kind=='acted':
                     item,after,error=value
                     if after: self.png=after; self.images.append(after)
