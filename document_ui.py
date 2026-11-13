@@ -49,10 +49,17 @@ def indexed_card_copy(db_path,path,limit=100000):
         return ('來源檔案：'+str(path)+'\n來源索引 SHA-256：'+str(doc[5] or '未提供')
                 +'\n這是由索引文字建立的獨立工作副本，不會自動隨來源更新；可能缺少圖片或格式，衍生內容可能有誤，請核對。'+notice+''.join(pieces))
 
-def _import_one(db_path,path,retry_target=''):
-    target=retry_target
+def _import_one(db_path,path,retry_target='',stage=None,on_prepare=None):
+    target=retry_target; staged=None
+    def prepare(target_path,temp_path,sha,size):
+        nonlocal staged
+        on_prepare(target_path,temp_path,sha,size)
+        staged={'planned':True,'target':str(target_path),'temp':str(temp_path),'expected_sha256':sha,'expected_size':size}
     try:
-        target,created=(core.retry_import_copy(str(db_path),retry_target,path) if retry_target else core.import_copy(str(db_path),path))
+        if stage:
+            target,created=core.recover_import_stage(str(db_path),stage['target'],stage['temp'],stage['expected_sha256'],stage['expected_size'],path)
+        elif retry_target: target,created=core.retry_import_copy(str(db_path),retry_target,path)
+        else: target,created=core.import_copy(str(db_path),path,on_prepare=prepare if on_prepare else None)
         with closing(core.connect(str(db_path))) as db:
             row=db.execute('''SELECT d.status,d.detail,EXISTS(SELECT 1 FROM chunks c WHERE c.document_id=d.id)
                 FROM documents d WHERE d.path=?''',(str(target),)).fetchone()
@@ -64,19 +71,23 @@ def _import_one(db_path,path,retry_target=''):
         else: state='匯入成功'
         return {'source':str(path),'state':state,'detail':detail,'target':str(target)}
     except Exception as e:
+        if stage or staged:
+            info=dict(stage or staged); info.update(source=str(path),state='副本待復原',detail=str(e),target=str(target or info.get('target','')),planned=True)
+            return info
         return {'source':str(path),'state':'未完成','detail':str(e),'target':str(target)}
 
-def import_batch(db_path,paths,cancelled=lambda:False,progress=lambda _:None,on_item=lambda index,item:None):
+def import_batch(db_path,paths,cancelled=lambda:False,progress=lambda _:None,on_item=lambda index,item:None,on_prepare=None):
     """Return a per-file outcome, including copied files whose parsing failed."""
     results=[]; paths=list(paths); total=len(paths)
     for index,path in enumerate(paths):
         if cancelled():
             results.extend({'source':str(p),'state':'未處理','detail':'使用者已取消','target':''} for p in paths[index:]); break
         if index==0 or index%10==0: progress(f'正在匯入 {index+1} / {total}：{Path(path).name}')
-        item=_import_one(db_path,path); on_item(index,item); results.append(item)
+        prepare=(lambda target,temp,sha,size:on_prepare(index,target,temp,sha,size)) if on_prepare else None
+        item=_import_one(db_path,path,on_prepare=prepare); on_item(index,item); results.append(item)
     return results
 
-def retry_import_batch(db_path,previous,cancelled=lambda:False,progress=lambda _:None,on_item=lambda index,item:None,positions=None):
+def retry_import_batch(db_path,previous,cancelled=lambda:False,progress=lambda _:None,on_item=lambda index,item:None,positions=None,on_prepare=None):
     """Retry failed or cancelled items while keeping successful outcomes."""
     results=[dict(item) for item in previous]
     if positions is not None:
@@ -90,7 +101,8 @@ def retry_import_batch(db_path,previous,cancelled=lambda:False,progress=lambda _
         if item.get('target_missing'): continue
         # A saved copy is re-parsed in place; no new copy is created.
         retry_target=item['target'] if item['target'] else ''
-        results[index]=_import_one(db_path,item['source'],retry_target); on_item(index,results[index])
+        prepare=(lambda target,temp,sha,size:on_prepare(index,target,temp,sha,size)) if on_prepare else None
+        results[index]=_import_one(db_path,item['source'],retry_target,stage=item if item.get('planned') else None,on_prepare=prepare); on_item(index,results[index])
     return results
 
 class DocumentWindow(tk.Toplevel):
@@ -156,8 +168,8 @@ class DocumentWindow(tk.Toplevel):
             try:
                 with import_history.ImportHistory(self.db_path) as history:
                     batch=history.create(paths); self.events.put(('import_started',batch))
-                    with import_history.batch_lock(self.db_path,batch):
-                        import_batch(self.db_path,paths,self.cancel.is_set,lambda text:self.events.put(('progress',text)),lambda i,item:history.update(batch,i,item))
+                    with import_history.operation_lock(self.db_path),import_history.batch_lock(self.db_path,batch):
+                        import_batch(self.db_path,paths,self.cancel.is_set,lambda text:self.events.put(('progress',text)),lambda i,item:history.update(batch,i,item),lambda i,t,temp,sha,size:history.prepare(batch,i,t,temp,sha,size))
                         if self.cancel.is_set(): history.cancel_pending(batch)
                     self.events.put(('import',(batch,history.load(batch))))
             except Exception as e: self.events.put(('error',str(e)))
@@ -222,7 +234,7 @@ class DocumentWindow(tk.Toplevel):
             tree.configure(yscrollcommand=scroll.set,xscrollcommand=horizontal.set)
             horizontal.pack(side='bottom',fill='x'); tree.pack(side='left',fill='both',expand=True); scroll.pack(side='right',fill='y')
             for index,item in eligible:
-                method='解析 APP 副本' if item['target'] else '讀取原來源'
+                method='復原 APP 暫存' if item.get('planned') else '解析 APP 副本' if item['target'] else '讀取原來源'
                 tree.insert('','end',iid=str(index),values=(item['state'],method,item['source'],item['target']))
             def update_selection(event=None):
                 chosen=[int(i) for i in tree.selection()]
@@ -233,15 +245,15 @@ class DocumentWindow(tk.Toplevel):
             def begin():
                 positions=[int(i) for i in tree.selection()]
                 if not positions: messagebox.showinfo('請選擇項目','請選擇至少一個要重試的項目。',parent=choose); return
-                approved={i:(snapshot[i]['source'],snapshot[i]['target']) for i in positions}
+                approved={i:(snapshot[i]['source'],snapshot[i]['target'],snapshot[i].get('planned'),snapshot[i].get('temp'),snapshot[i].get('expected_sha256'),snapshot[i].get('expected_size')) for i in positions}
                 self.importing=True; self.cancel.clear(); self.summary.set(f'正在重試選定的 {len(positions)} 個項目…'); w.destroy()
                 def work():
                     try:
-                        with import_history.batch_lock(self.db_path,batch),import_history.ImportHistory(self.db_path) as history:
+                        with import_history.operation_lock(self.db_path),import_history.batch_lock(self.db_path,batch),import_history.ImportHistory(self.db_path) as history:
                             previous=history.load(batch)
-                            if any(i>=len(previous) or previous[i].get('target_missing') or (previous[i]['source'],previous[i]['target'])!=approved[i] for i in positions):
+                            if any(i>=len(previous) or previous[i].get('target_missing') or (previous[i]['source'],previous[i]['target'],previous[i].get('planned'),previous[i].get('temp'),previous[i].get('expected_sha256'),previous[i].get('expected_size'))!=approved[i] for i in positions):
                                 raise ValueError('所選項目的來源或副本狀態已變更；請重新查看並選擇。')
-                            retry_import_batch(self.db_path,previous,self.cancel.is_set,lambda text:self.events.put(('progress',text)),lambda i,item:history.update(batch,i,item),positions=positions)
+                            retry_import_batch(self.db_path,previous,self.cancel.is_set,lambda text:self.events.put(('progress',text)),lambda i,item:history.update(batch,i,item),positions=positions,on_prepare=lambda i,t,temp,sha,size:history.prepare(batch,i,t,temp,sha,size))
                             if self.cancel.is_set(): history.cancel_pending(batch,positions=positions)
                             self.events.put(('import',(batch,history.load(batch))))
                     except Exception as e: self.events.put(('error',str(e)))
@@ -259,7 +271,47 @@ class DocumentWindow(tk.Toplevel):
             for when,source,state,detail in events: box.insert('end',f'{when} · {state}\n{source}\n{detail}\n\n')
             if not events: box.insert('end','尚無已完成的處理嘗試。')
             box.configure(state='disabled')
+        def clean_staging():
+            if self.importing: messagebox.showinfo('處理中','請等待目前作業完成。',parent=w); return
+            snapshot=[dict(item) for item in current['items']]; staged=[(i,item) for i,item in enumerate(snapshot) if item.get('planned')]
+            if not staged: messagebox.showinfo('沒有中斷暫存','此批次沒有已記錄的中斷暫存。',parent=w); return
+            batch=current['id']; choose=tk.Toplevel(w); choose.title('清理中斷暫存'); choose.geometry('930x540'); choose.configure(bg=WHITE); choose.transient(w); choose.grab_set()
+            label(choose,'選擇要清理的紀錄',font=(FONT,15,'bold')).pack(anchor='w',padx=18,pady=(14,4))
+            label(choose,'只處理 APP 記錄的暫存；完整且可復原的檔案會保留。清理不完整暫存後，如需重試可能需要重新讀取原來源。',fg=MUTED,wraplength=870,justify='left').pack(anchor='w',padx=18)
+            bottom=tk.Frame(choose,bg=WHITE); bottom.pack(side='bottom',fill='x',padx=18,pady=(0,14))
+            area=tk.Frame(choose,bg=WHITE); area.pack(fill='both',expand=True,padx=18,pady=10)
+            tree=ttk.Treeview(area,columns=('source','temp','state'),show='headings',selectmode='extended')
+            for key,title,width in [('source','原來源',300),('temp','APP 暫存路徑',360),('state','紀錄狀態',180)]: tree.heading(key,text=title); tree.column(key,width=width,minwidth=80)
+            scroll=ttk.Scrollbar(area,orient='vertical',command=tree.yview); horizontal=ttk.Scrollbar(area,orient='horizontal',command=tree.xview)
+            tree.configure(yscrollcommand=scroll.set,xscrollcommand=horizontal.set); horizontal.pack(side='bottom',fill='x'); tree.pack(side='left',fill='both',expand=True); scroll.pack(side='right',fill='y')
+            for index,item in staged: tree.insert('','end',iid=str(index),values=(item['source'],item.get('temp',''),item['detail']))
+            button(bottom,'全選',lambda:tree.selection_set(tree.get_children())).pack(side='left')
+            def begin_cleanup():
+                positions=[int(i) for i in tree.selection()]
+                if not positions: messagebox.showinfo('請選擇項目','請選擇至少一筆暫存紀錄。',parent=choose); return
+                if not messagebox.askyesno('確認清理',f'要檢查並清理選定的 {len(positions)} 筆 APP 暫存嗎？完整可復原內容會保留；不會刪除原始文件。',parent=choose): return
+                approved={i:(snapshot[i]['source'],snapshot[i]['target'],snapshot[i].get('temp'),snapshot[i].get('expected_sha256'),snapshot[i].get('expected_size')) for i in positions}
+                self.importing=True; self.cancel.clear(); self.summary.set('正在檢查選定的 APP 暫存…'); w.destroy()
+                def work():
+                    try:
+                        with import_history.operation_lock(self.db_path),import_history.batch_lock(self.db_path,batch),import_history.ImportHistory(self.db_path) as history:
+                            items=history.load(batch)
+                            if any(i>=len(items) or not items[i].get('planned') or (items[i]['source'],items[i]['target'],items[i].get('temp'),items[i].get('expected_sha256'),items[i].get('expected_size'))!=approved[i] for i in positions):
+                                raise ValueError('暫存紀錄已變更，請重新查看並選擇。')
+                            for number,index in enumerate(positions,1):
+                                if self.cancel.is_set(): break
+                                item=items[index]; self.events.put(('progress',f'正在檢查暫存 {number} / {len(positions)}'))
+                                try:
+                                    result=core.cleanup_import_stage(self.db_path,item['target'],item['temp'],item['expected_sha256'],item['expected_size'])
+                                    if result=='已清理': history.clear_stage(batch,index,'APP 暫存已清理；如需重試請重新確認原來源。')
+                                    else: history.note_stage(batch,index,'已清理多餘暫存並保留完整副本；請選擇復原。')
+                                except (OSError,ValueError) as e: history.note_stage(batch,index,str(e))
+                            self.events.put(('import',(batch,history.load(batch))))
+                    except Exception as e: self.events.put(('error',str(e)))
+                threading.Thread(target=work,daemon=True).start()
+            button(bottom,'檢查並清理所選',begin_cleanup,True).pack(side='right')
         button(actions,'查看嘗試歷程',show_attempts).pack(side='left')
+        button(actions,'處理中斷暫存',clean_staging).pack(side='left',padx=8)
         button(actions,'選擇重試項目',retry,True).pack(side='right')
         area=tk.Frame(w,bg=WHITE); area.pack(fill='both',expand=True,padx=18,pady=12)
         text=tk.Text(area,wrap='word',font=(FONT,10),fg=INK,bg='#f8fafc',bd=0,padx=10,pady=10)

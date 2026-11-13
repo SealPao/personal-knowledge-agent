@@ -11,6 +11,7 @@ import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
 import core
+import import_history
 
 FORMAT='pka-zip'; VERSION=1; MAX_FILES=10000; MAX_TOTAL=50*1024**3
 
@@ -40,6 +41,10 @@ def _source_inventory(root):
     return files,directories
 
 def create_package(db_path,destination,progress=lambda x:None,cancelled=lambda:False):
+    with import_history.operation_lock(db_path):
+        return _create_package(db_path,destination,progress,cancelled)
+
+def _create_package(db_path,destination,progress=lambda x:None,cancelled=lambda:False):
     db_path=Path(db_path).resolve(); destination=Path(destination).resolve()
     if destination.suffix.lower()!='.pka': raise ValueError('備份檔名必須以 .pka 結尾')
     if destination.exists(): raise ValueError('備份檔已存在，請選擇新檔名')
@@ -59,6 +64,9 @@ def create_package(db_path,destination,progress=lambda x:None,cancelled=lambda:F
             snap=sqlite3.connect(str(snapshot))
             try:
                 if snap.execute('PRAGMA quick_check').fetchone()[0]!='ok': raise ValueError('資料庫完整性檢查失敗')
+                staging=snap.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='import_staging'").fetchone()
+                if staging and snap.execute('SELECT 1 FROM import_staging LIMIT 1').fetchone():
+                    raise ValueError('有中斷的匯入暫存；請先復原或清理，再建立完整備份。')
                 rows=snap.execute('SELECT id,path,sha256,status FROM documents ORDER BY id').fetchall()
                 schema_version=snap.execute('PRAGMA user_version').fetchone()[0]
             finally: snap.close()

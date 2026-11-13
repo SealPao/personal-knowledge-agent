@@ -303,7 +303,12 @@ def scan(root, db_path, progress=lambda msg:None, cancelled=lambda:False, fast=F
         return counts,complete
     finally: db.close()
 
-def import_copy(db_path, source):
+def _publish_import_temp(temp,target):
+    # Never overwrite an existing APP file, even if a generated name collides.
+    if os.name=='nt': os.rename(temp,target)
+    else: os.link(temp,target); os.unlink(temp)
+
+def import_copy(db_path, source, on_prepare=None):
     """Copy one explicitly selected file into APP storage; never write to the source."""
     source=Path(source); st=os.stat(source,follow_symlinks=False)
     attrs=getattr(st,'st_file_attributes',0)
@@ -340,11 +345,15 @@ def import_copy(db_path, source):
         # A long Windows path or name is possible; fall back to an ID plus extension.
         if len(filename)>180: filename=uuid.uuid4().hex+ext
         target=folder/filename; temp=folder/(uuid.uuid4().hex+'.tmp')
+        created_temp=False
         try:
-            with open(temp,'xb') as f: f.write(data); f.flush(); os.fsync(f.fileno())
-            os.replace(temp,target)
+            with open(temp,'xb') as f:
+                created_temp=True
+                if on_prepare: on_prepare(target,temp,digest,len(data))
+                f.write(data); f.flush(); os.fsync(f.fileno())
+            _publish_import_temp(temp,target)
         finally:
-            if temp.exists(): temp.unlink()
+            if created_temp and temp.exists(): temp.unlink()
         copy_st=target.stat()
         try:
             chunks,detail=parse(target,data)
@@ -354,6 +363,76 @@ def import_copy(db_path, source):
             _record(db,str(target),ext,copy_st.st_size,copy_st.st_mtime_ns,digest,'error','手動匯入副本；原始路徑：'+str(source)+'；'+str(e),[])
         return str(target),True
     finally: db.close()
+
+def _stage_paths(db_path,target,temp,sha,size):
+    db_path=Path(db_path).resolve(); folder=db_path.parent/'imported'; target=Path(target); temp=Path(temp)
+    if target.parent.resolve()!=folder.resolve() or temp.parent.resolve()!=folder.resolve() or target.suffix.lower() not in SUPPORTED:
+        raise ValueError('暫存位置不屬於 APP 匯入區')
+    if not re.fullmatch(r'[0-9a-f]{32}(?:--.+)?\.[A-Za-z0-9]+',target.name) or not re.fullmatch(r'[0-9a-f]{32}\.tmp',temp.name): raise ValueError('暫存名稱無效')
+    if not re.fullmatch(r'[0-9a-f]{64}',str(sha)) or type(size) is not int or not 0<=size<=MAX_SIZE: raise ValueError('暫存驗證資料無效')
+    db=connect(str(db_path))
+    try:
+        row=db.execute("SELECT value FROM settings WHERE key='root'").fetchone()
+        if not row or contained(folder,row[0]): raise ValueError('匯入區不可位於原始來源中')
+    finally: db.close()
+    try: st=os.stat(folder,follow_symlinks=False)
+    except FileNotFoundError: return db_path,target,temp,False
+    if stat.S_ISLNK(st.st_mode) or getattr(st,'st_file_attributes',0)&(REPARSE|PLACEHOLDER): raise ValueError('匯入資料夾無法安全存取')
+    if not stat.S_ISDIR(st.st_mode): raise ValueError('匯入資料夾無法安全存取')
+    return db_path,target,temp,True
+
+def _stage_read(path):
+    before=os.stat(path,follow_symlinks=False); attrs=getattr(before,'st_file_attributes',0)
+    if not stat.S_ISREG(before.st_mode) or attrs&(PLACEHOLDER|REPARSE) or before.st_size>MAX_SIZE: raise ValueError('暫存檔或副本無法安全讀取')
+    with open(path,'rb') as f: data=f.read(MAX_SIZE+1)
+    after=os.stat(path,follow_symlinks=False)
+    if (len(data)>MAX_SIZE or not stat.S_ISREG(after.st_mode) or getattr(after,'st_file_attributes',0)&(PLACEHOLDER|REPARSE)
+            or before.st_size!=after.st_size or before.st_mtime_ns!=after.st_mtime_ns or len(data)!=after.st_size):
+        raise ValueError('讀取期間暫存檔或副本已改變')
+    return data,after
+
+def recover_import_stage(db_path,target,temp,sha,size,source_label):
+    """Recover only a journaled, complete APP-owned file; never read the original."""
+    db_path,target,temp,folder_exists=_stage_paths(db_path,target,temp,sha,size)
+    if not folder_exists: raise ValueError('找不到副本或暫存，請清理紀錄後重新選擇來源')
+    has_target=os.path.lexists(target); has_temp=os.path.lexists(temp)
+    if has_target and has_temp: raise ValueError('同時存在副本與暫存，請先安全清理暫存')
+    if not has_target and not has_temp: raise ValueError('找不到副本或暫存，請清理紀錄後重新選擇來源')
+    candidate=target if has_target else temp; data,_=_stage_read(candidate)
+    if len(data)!=size or hashlib.sha256(data).hexdigest()!=sha: raise ValueError('暫存檔或副本不完整或已變更，未復原')
+    if not has_target:
+        _publish_import_temp(temp,target)
+    db=connect(str(db_path))
+    try:
+        row=db.execute('SELECT status,sha256 FROM documents WHERE path=?',(str(target),)).fetchone()
+        if row:
+            if row[1]!=sha: raise ValueError('既有索引與待復原副本不符')
+            return retry_import_copy(db_path,target,source_label)
+        after=os.stat(target,follow_symlinks=False); prefix='手動匯入副本；原始路徑：'+str(source_label)+'；'
+        try:
+            chunks,detail=parse(target,data)
+            if not chunks: detail+='；未擷取到可搜尋文字'
+            _record(db,str(target),target.suffix.lower(),after.st_size,after.st_mtime_ns,sha,'indexed',prefix+detail,chunks)
+        except Exception as e:
+            _record(db,str(target),target.suffix.lower(),after.st_size,after.st_mtime_ns,sha,'error',prefix+str(e),[])
+        return str(target),True
+    finally: db.close()
+
+def cleanup_import_stage(db_path,target,temp,sha,size):
+    """Remove only a journaled APP temp, preserving complete recoverable data."""
+    _,target,temp,folder_exists=_stage_paths(db_path,target,temp,sha,size)
+    if not folder_exists: return '已清理'
+    has_target=os.path.lexists(target); has_temp=os.path.lexists(temp)
+    if has_target:
+        data,_=_stage_read(target)
+        if len(data)!=size or hashlib.sha256(data).hexdigest()!=sha: raise ValueError('副本已變更，未清理任何檔案')
+        if not has_temp: raise ValueError('已有完整副本，請使用復原而非清理')
+        _stage_read(temp); temp.unlink(); return '保留副本'
+    if has_temp:
+        data,_=_stage_read(temp)
+        if len(data)==size and hashlib.sha256(data).hexdigest()==sha: raise ValueError('暫存完整且可復原，請使用復原而非清理')
+        temp.unlink()
+    return '已清理'
 
 def retry_import_copy(db_path,target,source_label):
     """Re-parse an unchanged APP-owned import; never rewrite the file."""
