@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from PIL import Image
-import adb_research,adb_service,ai_service,core,package_service
+import adb_research,adb_service,adb_ui,ai_service,core,package_service
+from types import SimpleNamespace
 
 class ReviewTests(unittest.TestCase):
     def setUp(self):
@@ -49,5 +50,16 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(self.detail(card),'使用者校對的 AI 裝置操作紀錄')
         con=sqlite3.connect(self.db); count=con.execute('SELECT count(*) FROM ai_card_reviews').fetchone()[0]; con.close()
         self.assertEqual(count,1)
+    def test_saving_device_session_does_not_imply_review(self):
+        buffer=io.BytesIO(); Image.new('RGB',(20,20),'white').save(buffer,format='PNG')
+        png=buffer.getvalue(); card=adb_service.save_session(self.db,'探索','閱讀器畫面步驟',[png])
+        status=SimpleNamespace(set=lambda value: setattr(status,'value',value))
+        window=SimpleNamespace(png=png,busy=False,agent_active=False,images=[png],db=self.db,
+            titlevar=SimpleNamespace(get=lambda:'探索'),note=SimpleNamespace(get=lambda *args:'閱讀器畫面步驟'),
+            session_path=card,master=object(),status=status)
+        adb_ui.DeviceWindow.save(window)
+        self.assertIn('尚未人工校對',self.detail(card)); self.assertIn('人工審核',status.value)
+        self.assertEqual(core.review_ai_card(self.db,card,True),'使用者校對的 AI 裝置操作紀錄')
+        self.assertEqual(self.original.read_text(encoding='utf-8'),'原始文件')
 
 if __name__=='__main__': unittest.main()

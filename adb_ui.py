@@ -209,10 +209,10 @@ class DeviceWindow(tk.Toplevel):
         try:
             if self.busy or self.agent_active: raise ValueError('請先停止 AI 並等待目前操作結束')
             notes=self.note.get('1.0','end').strip()
-            if self.images: adb_service.save_session(self.db,self.titlevar.get(),notes,self.images,reviewed=True,existing=self.session_path)
+            if self.images: adb_service.save_session(self.db,self.titlevar.get(),notes,self.images,existing=self.session_path)
             else: adb_service.save_note(self.db,self.titlevar.get(),notes,self.png)
             if hasattr(self.master,'refresh_metrics'): self.master.refresh_metrics()
-            self.status.set('已儲存使用者紀錄及截圖；文字已加入搜尋，可供 AI 引用。')
+            self.status.set('已儲存紀錄及截圖；AI 探索紀錄仍需至文件管理中人工審核。' if self.images else '已儲存使用者紀錄及截圖；文字已加入搜尋，可供 AI 引用。')
         except Exception as e: messagebox.showerror('無法儲存紀錄',str(e),parent=self)
     def poll(self):
         try:
