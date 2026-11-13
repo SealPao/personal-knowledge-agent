@@ -22,6 +22,16 @@ class DeviceTests(unittest.TestCase):
             Result.stdout=self.png; self.assertEqual(adb_service.screenshot('abc-123',runner),self.png)
             with self.assertRaises(ValueError): adb_service.screenshot('abc; reboot',runner)
         self.assertEqual(calls[1],['adb.exe','-s','abc-123','exec-out','screencap','-p'])
+    def test_device_info_reads_only_whitelisted_properties(self):
+        calls=[]
+        class Result: returncode=0; stdout=b'Test device\n'
+        def runner(args,**kw): calls.append(args); return Result()
+        with patch.object(adb_service,'executable',return_value='adb.exe'):
+            info=adb_service.device_info('reader-123',runner)
+            self.assertEqual(info['model'],'Test device'); self.assertEqual(len(calls),4)
+            self.assertEqual({x[-1] for x in calls},{'ro.product.manufacturer','ro.product.model','ro.build.version.release','ro.build.display.id'})
+            self.assertTrue(all(x[1:5]==['-s','reader-123','shell','getprop'] for x in calls))
+            with self.assertRaises(ValueError): adb_service.device_info('reader;reboot',runner)
     def test_reviewed_note_and_image_survive_backup(self):
         original=(self.source/'manual.txt').read_bytes()
         card=adb_service.save_note(self.db,'閱讀器設定紀錄','第一步開啟裝置的閱讀設定。第二步選擇文字大小。',self.png)

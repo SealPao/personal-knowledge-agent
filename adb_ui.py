@@ -90,7 +90,9 @@ class DeviceWindow(tk.Toplevel):
         threading.Thread(target=worker,daemon=True).start()
     def open_research(self):
         import research_ui
-        research_ui.ResearchWindow(self.master,self.db)
+        selected=self.list.selection()
+        serial=self.rows[int(selected[0])][0] if selected and self.rows[int(selected[0])][1]=='device' else None
+        research_ui.ResearchWindow(self.master,self.db,serial)
     def detect(self):
         if not self.agent_active: self.work('devices',adb_service.devices)
     def capture(self):

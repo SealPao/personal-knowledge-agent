@@ -41,6 +41,18 @@ def screenshot(serial,runner=subprocess.run):
     if len(data)>MAX_IMAGE or len(data)<32 or not data.startswith(PNG): raise ValueError('裝置沒有回傳有效截圖，或截圖過大')
     return data
 
+def device_info(serial,runner=subprocess.run):
+    """Only read four fixed Android properties; never collect the serial into a note."""
+    if not re.fullmatch(r'[A-Za-z0-9._:-]{1,128}',serial): raise ValueError('裝置識別碼無效')
+    result={}
+    for name,prop in (('brand','ro.product.manufacturer'),('model','ro.product.model'),('android','ro.build.version.release'),('firmware','ro.build.display.id')):
+        raw=_run(['-s',serial,'shell','getprop',prop],timeout=15,runner=runner)
+        if len(raw)>2048: raise ValueError('裝置資訊回應過大')
+        value=raw.decode('utf-8','replace').strip()
+        if any(c in value for c in '\r\n\x00') or len(value)>200: raise ValueError('裝置資訊格式無效')
+        result[name]=value
+    return result
+
 def image_info(png):
     with Image.open(io.BytesIO(png)) as im:
         if im.format!='PNG' or im.width*im.height>25_000_000 or min(im.size)<1: raise ValueError('裝置截圖無效或過大')

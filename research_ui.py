@@ -4,7 +4,7 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import ttk,messagebox
-import adb_research,ai_service,ai_ui
+import adb_research,adb_service,ai_service,ai_ui
 
 FONT='Microsoft JhengHei UI'; WHITE='#ffffff'; INK='#1b2c40'; MUTED='#64748b'
 def label(p,text='',**kw):
@@ -13,10 +13,10 @@ def button(p,text,fn):
     return tk.Button(p,text=text,command=fn,font=(FONT,10,'bold'),bg='#e9f0fb',fg='#1d4ed8',bd=0,padx=10,pady=6,cursor='hand2')
 
 class ResearchWindow(tk.Toplevel):
-    def __init__(self,master,db):
-        super().__init__(master); self.db=db; self.busy=False; self.events=queue.Queue(); self.title('ADB 指令研究模式'); self.geometry('850x720'); self.configure(bg=WHITE)
+    def __init__(self,master,db,device_serial=None):
+        super().__init__(master); self.db=db; self.device_serial=device_serial; self.busy=False; self.events=queue.Queue(); self.title('ADB 指令研究模式'); self.geometry('850x720'); self.configure(bg=WHITE)
         label(self,'ADB 指令研究模式',font=(FONT,16,'bold')).pack(anchor='w',padx=20,pady=(16,4))
-        label(self,'查詢公開資料並保存待驗證筆記；不會連接閱讀器或執行指令。',fg=MUTED,wraplength=780,justify='left').pack(anchor='w',padx=20)
+        label(self,'查詢公開資料並保存待驗證筆記；不會自動讀取裝置或執行研究指令。',fg=MUTED,wraplength=780,justify='left').pack(anchor='w',padx=20)
         fields=tk.Frame(self,bg=WHITE); fields.pack(fill='x',padx=20,pady=10)
         self.brand=tk.StringVar(); self.model=tk.StringVar(); self.firmware=tk.StringVar(); self.question=tk.StringVar(value='如何透過 ADB 查詢或調整前光與刷新模式？')
         for col,(title,var) in enumerate([('品牌（可自行輸入）',self.brand),('型號（可留空）',self.model),('韌體／Android（可留空）',self.firmware)]):
@@ -28,9 +28,19 @@ class ResearchWindow(tk.Toplevel):
         tk.Entry(self,textvariable=self.question,font=(FONT,11)).pack(fill='x',padx=20,pady=5,ipady=5)
         row=tk.Frame(self,bg=WHITE); row.pack(fill='x',padx=20,pady=8)
         button(row,'搜尋並建立研究筆記',self.start).pack(side='left')
+        button(row,'讀取已選裝置資訊',self.identify).pack(side='left',padx=6)
         self.status=tk.StringVar(value='研究需要 OpenAI 外網與支援網路搜尋的模型；搜尋費用可能另外計算。'); label(row,textvariable=self.status,fg=MUTED,wraplength=520,justify='left').pack(side='left',padx=12)
         self.text=tk.Text(self,wrap='word',font=(FONT,10),bg='#f8fafc',fg=INK,bd=0,padx=12,pady=12); self.text.pack(fill='both',expand=True,padx=20,pady=(0,20)); self.text.configure(state='disabled')
         self.after(150,self.poll); self.protocol('WM_DELETE_WINDOW',self.close)
+    def identify(self):
+        if self.busy: return
+        if not self.device_serial:
+            messagebox.showinfo('請先選擇裝置','請在閱讀器連線畫面先偵測並選擇已授權的裝置。',parent=self); return
+        self.busy=True; self.status.set('正在唯讀取得品牌、型號及韌體…')
+        def work():
+            try: self.events.put(('device_info',adb_service.device_info(self.device_serial)))
+            except Exception as e: self.events.put(('error',str(e)))
+        threading.Thread(target=work,daemon=True).start()
     def start(self):
         if self.busy: return
         brand=self.brand.get().strip(); model=self.model.get().strip(); firmware=self.firmware.get().strip(); question=self.question.get().strip(); config=ai_ui.read_config(self.db.parent/'ai-settings.json')
@@ -51,7 +61,11 @@ class ResearchWindow(tk.Toplevel):
         try:
             while True:
                 kind,value=self.events.get_nowait(); self.busy=False
-                if kind=='error': self.status.set('研究未完成：'+value)
+                if kind=='error': self.status.set('操作未完成：'+value)
+                elif kind=='device_info':
+                    self.brand.set(value['brand']); self.model.set(value['model'])
+                    self.firmware.set(' / '.join(x for x in (('Android '+value['android']) if value['android'] else '',value['firmware']) if x))
+                    self.status.set('已讀取裝置資訊；請確認內容後再選擇是否搜尋。')
                 else:
                     result,path=value; self.text.configure(state='normal'); self.text.delete('1.0','end'); self.text.insert('end',result['text']+'\n\n來源（點擊開啟）：\n')
                     for i,source in enumerate(result['sources'],1):
