@@ -70,6 +70,18 @@ class PrototypeTests(unittest.TestCase):
         self.assertEqual(core.search(str(self.db),'專屬操作')[0][0],path)
         same,created=core.import_copy(str(self.db),str(other)); self.assertFalse(created); self.assertEqual(path,same)
         core.scan(str(self.source),str(self.db)); self.assertEqual(core.search(str(self.db),'專屬操作')[0][1],'indexed')
+    def test_import_makes_portable_copy_even_if_external_source_indexed(self):
+        core.scan(str(self.source),str(self.db)); original=self.source/'guide.md'; before=original.read_bytes()
+        copy,created=core.import_copy(str(self.db),str(original))
+        self.assertTrue(created); self.assertNotEqual(str(original),copy); self.assertTrue(core.contained(copy,self.db.parent/'imported'))
+        self.assertEqual(Path(copy).read_bytes(),before); self.assertEqual(original.read_bytes(),before)
+        same,created=core.import_copy(str(self.db),str(original)); self.assertFalse(created); self.assertEqual(copy,same)
+    def test_import_does_not_deduplicate_against_tampered_copy(self):
+        core.scan(str(self.source),str(self.db)); original=self.source/'guide.md'
+        copy,_=core.import_copy(str(self.db),str(original)); target=Path(copy); st=target.stat()
+        data=target.read_bytes(); target.write_bytes(bytes([data[0]^1])+data[1:]); os.utime(target,ns=(st.st_atime_ns,st.st_mtime_ns))
+        new,created=core.import_copy(str(self.db),str(original))
+        self.assertTrue(created); self.assertNotEqual(new,copy); self.assertEqual(Path(new).read_bytes(),original.read_bytes())
     def test_automatic_scan_skips_unchanged_source_reads(self):
         core.scan(str(self.source),str(self.db)); original_open=open
         def guarded(path,*args,**kwargs):

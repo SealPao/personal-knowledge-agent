@@ -321,8 +321,21 @@ def import_copy(db_path, source):
         after=os.stat(source,follow_symlinks=False)
         if len(data)>MAX_SIZE or after.st_size!=st.st_size or after.st_mtime_ns!=st.st_mtime_ns: raise ValueError('讀取期間來源改變或超過大小上限')
         digest=hashlib.sha256(data).hexdigest()
-        duplicate=db.execute("SELECT path FROM documents WHERE sha256=? AND status='indexed' LIMIT 1",(digest,)).fetchone()
-        if duplicate: return duplicate[0],False
+        candidates=db.execute("SELECT path,size,mtime_ns FROM documents WHERE sha256=? AND status='indexed'",(digest,)).fetchall()
+        for candidate,size,mtime in candidates:
+            try:
+                candidate=Path(candidate)
+                if candidate.parent.resolve()!=folder.resolve(): continue
+                candidate_st=os.stat(candidate,follow_symlinks=False); candidate_attrs=getattr(candidate_st,'st_file_attributes',0)
+                if not stat.S_ISREG(candidate_st.st_mode) or candidate_attrs & (PLACEHOLDER|REPARSE): continue
+                if candidate_st.st_size!=size or candidate_st.st_size!=len(data) or candidate_st.st_mtime_ns!=mtime: continue
+                existing_hash=hashlib.sha256()
+                with open(candidate,'rb') as existing:
+                    for block in iter(lambda:existing.read(1024*1024),b''): existing_hash.update(block)
+                after_candidate=os.stat(candidate,follow_symlinks=False)
+                if after_candidate.st_size==candidate_st.st_size and after_candidate.st_mtime_ns==candidate_st.st_mtime_ns and existing_hash.hexdigest()==digest:
+                    return str(candidate),False
+            except OSError: continue
         filename=uuid.uuid4().hex+'--'+source.name
         # A long Windows path or name is possible; fall back to an ID plus extension.
         if len(filename)>180: filename=uuid.uuid4().hex+ext

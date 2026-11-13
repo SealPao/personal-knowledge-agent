@@ -48,6 +48,13 @@ class SearchQualityTests(unittest.TestCase):
                 refs=ai_service.retrieve(str(self.db),question)
                 names={Path(item['path']).name for item in refs}
                 self.assertIn('PocketBook Era.md',names); self.assertIn('PocketBook Verse.md',names)
+    def test_identical_content_with_distinct_model_filenames_is_not_collapsed(self):
+        a=self.source/'BrandA ModelOne.md'; b=self.source/'BrandA ModelTwo.md'
+        a.write_text('# 充電\n使用 USB 充電線。',encoding='utf8'); b.write_bytes(a.read_bytes())
+        core.scan(str(self.source),str(self.db))
+        refs=ai_service.retrieve(str(self.db),'比較 BrandA ModelOne 和 ModelTwo 充電')
+        names={Path(item['path']).name for item in refs}
+        self.assertIn(a.name,names); self.assertIn(b.name,names)
     def test_filename_match_does_not_supply_unrelated_topic(self):
         refs=ai_service.retrieve(str(self.db),'PocketBook Era 切換刷新模式')
         self.assertFalse(any(Path(item['path']).name=='PocketBook Era.md' for item in refs))

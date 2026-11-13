@@ -29,6 +29,17 @@ class PackageTests(unittest.TestCase):
         self.assertTrue(core.search(str(db),'個人知識卡')); self.assertTrue((restored/'data'/'cards').exists())
         self.assertEqual(budget.get_settings(db)['monthly'],'10')
         workspace.activate(self.base,db); self.assertEqual(workspace.active_database(self.base),db.resolve())
+    def test_external_document_and_its_explicit_copy_survive_export(self):
+        original=self.source/'manual.md'; before=original.read_bytes()
+        copied,created=core.import_copy(self.db,original); self.assertTrue(created)
+        count,_=package.create_package(self.db,self.file); self.assertEqual(count,3)
+        restored,_,_=package.restore_package(self.file,self.base,self.source)
+        db=core.connect(str(restored/'data'/'knowledge.sqlite3'))
+        try: paths=[Path(row[0]) for row in db.execute('SELECT path FROM documents').fetchall()]
+        finally: db.close()
+        restored_copy=next(path for path in paths if core.contained(path,restored/'data'/'imported'))
+        self.assertEqual(restored_copy.read_bytes(),before); self.assertEqual((restored/'source'/'manual.md').read_bytes(),before)
+        self.assertEqual(original.read_bytes(),before)
     def test_export_does_not_overwrite_or_write_source(self):
         with self.assertRaises(ValueError): package.create_package(self.db,self.source/'backup.pka')
         self.file.write_bytes(b'keep')

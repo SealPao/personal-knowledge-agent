@@ -48,10 +48,34 @@ def indexed_card_copy(db_path,path,limit=100000):
         return ('來源檔案：'+str(path)+'\n來源索引 SHA-256：'+str(doc[5] or '未提供')
                 +'\n這是由索引文字建立的獨立工作副本，不會自動隨來源更新；可能缺少圖片或格式，衍生內容可能有誤，請核對。'+notice+''.join(pieces))
 
+def import_batch(db_path,paths,cancelled=lambda:False,progress=lambda _:None):
+    """Return a per-file outcome, including copied files whose parsing failed."""
+    results=[]; paths=list(paths); total=len(paths)
+    for index,path in enumerate(paths):
+        if cancelled():
+            results.extend({'source':str(p),'state':'未處理','detail':'使用者已取消','target':''} for p in paths[index:]); break
+        if index==0 or index%10==0: progress(f'正在匯入 {index+1} / {total}：{Path(path).name}')
+        target=''
+        try:
+            target,created=core.import_copy(str(db_path),path)
+            with closing(core.connect(str(db_path))) as db:
+                row=db.execute('''SELECT d.status,d.detail,EXISTS(SELECT 1 FROM chunks c WHERE c.document_id=d.id)
+                    FROM documents d WHERE d.path=?''',(str(target),)).fetchone()
+            if not row: raise ValueError('副本已寫入，但索引紀錄無法確認')
+            status,detail,has_text=row
+            if not created: state='已有副本'
+            elif status!='indexed': state='副本已保存，解析失敗'
+            elif not has_text: state='副本已保存，沒有可搜尋文字'
+            else: state='匯入成功'
+            results.append({'source':str(path),'state':state,'detail':detail,'target':str(target)})
+        except Exception as e:
+            results.append({'source':str(path),'state':'未完成','detail':str(e),'target':str(target)})
+    return results
+
 class DocumentWindow(tk.Toplevel):
     def __init__(self,master,db_path):
         super().__init__(master); self.title('文件管理 · 私人知識助理'); self.geometry('1120x760'); self.minsize(900,620); self.configure(bg=BG)
-        self.db_path=Path(db_path); self.cards=self.db_path.parent/'cards'; self.rows=[]; self.active=None; self.events=queue.Queue(); self.importing=False; self.cancel=threading.Event(); self.refresh_after=None
+        self.db_path=Path(db_path); self.cards=self.db_path.parent/'cards'; self.rows=[]; self.active=None; self.events=queue.Queue(); self.importing=False; self.cancel=threading.Event(); self.refresh_after=None; self.import_results=[]
         self.filter=tk.StringVar(); self.kind=tk.StringVar(value='全部文件'); self.info=tk.StringVar(value='選擇文件以查看狀態。'); self.summary=tk.StringVar()
         head=tk.Frame(self,bg=BG); head.pack(fill='x',padx=24,pady=(20,8))
         label(head,'文件管理',bg=BG,font=(FONT,19,'bold')).pack(side='left')
@@ -59,6 +83,7 @@ class DocumentWindow(tk.Toplevel):
         button(head,'匯入文件副本',self.import_files).pack(side='right',padx=8)
         button(head,'備份與還原',self.backup_dialog).pack(side='right')
         button(head,'取消處理',self.cancel.set).pack(side='right',padx=8)
+        button(head,'匯入結果',self.show_import_results).pack(side='right')
         label(self,'原始文件維持唯讀；自行編輯的知識卡保存在 APP 資料夾並可搜尋。',bg=BG,fg=MUTED).pack(anchor='w',padx=25)
         footer=tk.Frame(self,bg=BG); footer.pack(side='bottom',fill='x',padx=25,pady=(0,15))
         label(footer,textvariable=self.summary,bg=BG,fg=MUTED,anchor='w').pack(fill='x')
@@ -70,6 +95,13 @@ class DocumentWindow(tk.Toplevel):
         body=tk.PanedWindow(self,orient='horizontal',bg=BG,bd=0,sashwidth=8); body.pack(fill='both',expand=True,padx=24,pady=(0,12))
         left=tk.Frame(body,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1); right=tk.Frame(body,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1)
         body.add(left,minsize=420,stretch='always'); body.add(right,minsize=300,stretch='always')
+        right_canvas=tk.Canvas(right,bg=WHITE,highlightthickness=0,bd=0)
+        self.details_canvas=right_canvas
+        right_scroll=ttk.Scrollbar(right,orient='vertical',command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_scroll.set); right_scroll.pack(side='right',fill='y'); right_canvas.pack(side='left',fill='both',expand=True)
+        right=tk.Frame(right_canvas,bg=WHITE); right_window=right_canvas.create_window((0,0),window=right,anchor='nw')
+        right.bind('<Configure>',lambda event:right_canvas.configure(scrollregion=right_canvas.bbox('all')))
+        right_canvas.bind('<Configure>',lambda event:right_canvas.itemconfigure(right_window,width=event.width))
         label(left,'文件清單',font=(FONT,12,'bold')).pack(anchor='w',padx=15,pady=12)
         table=tk.Frame(left,bg=WHITE); table.pack(fill='both',expand=True,padx=10,pady=(0,10))
         self.tree=ttk.Treeview(table,columns=('name','type','state'),show='headings',selectmode='browse')
@@ -100,15 +132,8 @@ class DocumentWindow(tk.Toplevel):
         if not paths: return
         self.importing=True; self.cancel.clear(); self.summary.set(f'正在匯入 {len(paths)} 個文件副本…')
         def work():
-            created=0; duplicates=0; errors=[]
-            for path in paths:
-                if self.cancel.is_set(): errors.append('使用者已取消；其餘文件未處理'); break
-                try:
-                    result,new=core.import_copy(str(self.db_path),path)
-                    if new: created+=1
-                    else: duplicates+=1
-                except Exception as e: errors.append(Path(path).name+'：'+str(e))
-            self.events.put(('import',(created,duplicates,errors)))
+            try: self.events.put(('import',import_batch(self.db_path,paths,self.cancel.is_set,lambda text:self.events.put(('progress',text)))))
+            except Exception as e: self.events.put(('error',str(e)))
         threading.Thread(target=work,daemon=True).start()
     def poll(self):
         try:
@@ -117,9 +142,11 @@ class DocumentWindow(tk.Toplevel):
                 if kind=='progress': self.summary.set(value); continue
                 self.importing=False
                 if kind=='import':
-                    created,duplicates,errors=value; self.refresh(); self.master.refresh_metrics()
-                    self.summary.set(f'匯入完成：新增 {created}、已有相同內容 {duplicates}、失敗 {len(errors)}。')
-                    if errors: messagebox.showwarning('部分文件未匯入','\n'.join(errors[:20]),parent=self)
+                    self.import_results=value; self.refresh(); self.master.refresh_metrics()
+                    count=lambda state:sum(item['state']==state for item in value)
+                    attention=sum(item['state'] not in ('匯入成功','已有副本') for item in value)
+                    self.summary.set(f'匯入結果：成功 {count("匯入成功")}、已有副本 {count("已有副本")}、需處理或未處理 {attention}。')
+                    if attention: messagebox.showwarning('部分文件需要處理','部分副本沒有可搜尋文字、解析失敗或尚未處理；請查看最近匯入結果。',parent=self)
                 elif kind=='backup':
                     path,count,size=value; self.summary.set(f'備份完成：{count} 個文件。'); messagebox.showinfo('備份完成',f'已建立 {count} 個文件的封裝：\n{path}',parent=self)
                 elif kind=='restore':
@@ -132,6 +159,21 @@ class DocumentWindow(tk.Toplevel):
                 elif kind=='error': self.summary.set('操作未完成。'); messagebox.showerror('備份或還原未完成',value,parent=self)
         except queue.Empty: pass
         if self.winfo_exists(): self.poll_id=self.after(150,self.poll)
+
+    def show_import_results(self):
+        if not self.import_results: messagebox.showinfo('尚無匯入結果','此視窗尚未執行匯入。',parent=self); return
+        w=tk.Toplevel(self); w.title('最近匯入結果'); w.geometry('820x580'); w.configure(bg=WHITE)
+        label(w,'最近匯入結果',font=(FONT,15,'bold')).pack(anchor='w',padx=18,pady=(16,4))
+        label(w,'解析失敗的副本仍保存在 APP；沒有可搜尋文字的文件可能需要 OCR。',fg=MUTED,wraplength=760,justify='left').pack(anchor='w',padx=18)
+        area=tk.Frame(w,bg=WHITE); area.pack(fill='both',expand=True,padx=18,pady=12)
+        text=tk.Text(area,wrap='word',font=(FONT,10),fg=INK,bg='#f8fafc',bd=0,padx=10,pady=10)
+        scroll=ttk.Scrollbar(area,command=text.yview); text.configure(yscrollcommand=scroll.set); text.pack(side='left',fill='both',expand=True); scroll.pack(side='right',fill='y')
+        for item in self.import_results:
+            text.insert('end',f"{item['state']} · {Path(item['source']).name}\n來源：{item['source']}\n")
+            if item['target']: text.insert('end','副本或既有項目：'+item['target']+'\n')
+            if item['detail']: text.insert('end',item['detail']+'\n')
+            text.insert('end','\n')
+        text.configure(state='disabled')
 
     def close(self):
         if self.importing: messagebox.showinfo('處理中','請等候目前的匯入或備份完成，或先按取消。',parent=self); return

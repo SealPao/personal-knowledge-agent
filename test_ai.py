@@ -52,6 +52,14 @@ class AITests(unittest.TestCase):
         refs=ai.retrieve(str(self.db),'BOOX 重置入口在哪裡')
         match=[r for r in refs if r['path']==str(path)]
         self.assertTrue(match); self.assertIn('重置入口在系統選單',match[0]['excerpt'])
+    def test_original_and_identical_managed_copy_do_not_duplicate_ai_evidence(self):
+        path=self.source/'BOOX 操作手冊.md'; copied,created=core.import_copy(self.db,path); self.assertTrue(created)
+        refs=ai.retrieve(str(self.db),'BOOX Wi-Fi')
+        relevant=[ref for ref in refs if ref['path'] in (str(path),copied)]
+        self.assertEqual(len(relevant),1)
+        path.unlink()
+        refs=ai.retrieve(str(self.db),'BOOX Wi-Fi')
+        self.assertTrue(any(ref['path']==copied for ref in refs))
     def test_source_changed_after_preview_is_not_sent(self):
         refs=ai.retrieve(str(self.db),'BOOX Wi-Fi'); path=self.source/'BOOX 操作手冊.md'
         path.write_text('BOOX 更新後的 Wi-Fi 操作',encoding='utf-8')

@@ -44,5 +44,24 @@ class DocumentManagementTests(unittest.TestCase):
         self.assertEqual(chosen,[sources[1]])
         with self.assertRaises(ValueError): ai_ui.selected_sources(sources,[False,False])
         with self.assertRaises(ValueError): ai_ui.selected_sources(sources,[True])
+    def test_batch_reports_success_duplicate_empty_error_and_unsupported(self):
+        good=self.root/'good.txt'; good.write_text('正常內容',encoding='utf8')
+        empty=self.root/'empty.txt'; empty.write_text('',encoding='utf8')
+        broken=self.root/'broken.txt'; broken.write_text('解析測試',encoding='utf8')
+        unsupported=self.root/'other.bin'; unsupported.write_bytes(b'data')
+        original_parse=core.parse
+        def parse(path,data):
+            if Path(path).name.endswith('broken.txt'): raise ValueError('模擬解析失敗')
+            return original_parse(path,data)
+        with patch.object(core,'parse',side_effect=parse):
+            items=document_ui.import_batch(self.db,[good,good,empty,broken,unsupported])
+        self.assertEqual([x['state'] for x in items],['匯入成功','已有副本','副本已保存，沒有可搜尋文字','副本已保存，解析失敗','未完成'])
+        self.assertTrue(Path(items[3]['target']).exists()); self.assertIn('模擬解析失敗',items[3]['detail'])
+        self.assertEqual(self.manual.read_bytes(),self.original)
+    def test_cancel_marks_remaining_files_unprocessed(self):
+        a=self.root/'a.txt'; a.write_text('第一份內容',encoding='utf8')
+        b=self.root/'b.txt'; b.write_text('第二份內容',encoding='utf8')
+        count=iter((False,True)); items=document_ui.import_batch(self.db,[a,b],cancelled=lambda:next(count))
+        self.assertEqual([x['state'] for x in items],['匯入成功','未處理']); self.assertTrue(b.exists())
 
 if __name__=='__main__': unittest.main()

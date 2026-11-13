@@ -1,5 +1,6 @@
 """Provider-agnostic retrieval and cited answers; does not store questions or secrets."""
 import ctypes
+import hashlib
 from ctypes import wintypes
 import json
 import os
@@ -130,7 +131,7 @@ def retrieve(db_path, question):
         value+=0.35*sum(bool(re.search(r'(?<![a-z0-9])'+re.escape(term)+r'(?![a-z0-9])',stem)) for term in filename_terms)
         value+=0.06*len(matched[ident])
         return value
-    result=[]; per_doc={}; total=0
+    result=[]; per_doc={}; seen_chunks=set(); total=0
     compare=bool(re.search(r'比較|對比|差異|差別|不同|比较|对比|区别|\bvs\b|\bversus\b',question,re.I))
     if len(filename_matches)>=3 and re.search(r'和|跟|與|以及|\band\b',question,re.I): compare=True
     model_scope=filename_matches if len(filename_matches)>=2 and not compare else set()
@@ -145,6 +146,9 @@ def retrieve(db_path, question):
         if brands and nonbrand and not any(t in (text+' '+locator).lower() for t in nonbrand): continue
         if nonbrand and not any(t in (text+' '+locator).lower() for t in nonbrand): continue
         if per_doc.get(path,0)>=2: continue
+        name=re.sub(r'^[0-9a-f]{32}--','',Path(path).name.lower())
+        duplicate=(sha,name,locator,ident[0],hashlib.sha256(text.encode('utf-8')).digest()) if sha else None
+        if duplicate and duplicate in seen_chunks: continue
         # Prefer a window containing question terms over an early brand-only mention.
         lower=text.lower(); terms=[t.lower() for t in tokens if t.lower() not in brands]
         starts={0}
@@ -162,6 +166,7 @@ def retrieve(db_path, question):
         remaining=MAX_CONTEXT-total
         if remaining<200: break
         excerpt=excerpt[:remaining]; total+=len(excerpt); per_doc[path]=per_doc.get(path,0)+1
+        if duplicate: seen_chunks.add(duplicate)
         kind=({'ocr':'PDF OCR 衍生文字（使用者校對，可能有誤）','table':'PDF 表格擷取（使用者校對，可能有誤）','scanned_table':'PDF 掃描表格 OCR（使用者校對，欄位可能錯置）'}.get(row[8],'PDF 衍生內容（可能有誤）')) if len(row)>9 else detail if detail in core.AI_REVIEW_STATES else '使用者知識卡' if detail=='使用者知識卡；非原始文件' else '來源文件（部分頁面擷取失敗）' if '擷取失敗' in detail else '來源文件（來源可信度未確認）'
         result.append({'id':len(result)+1,'path':path,'locator':locator,'excerpt':excerpt,'sha256':sha,'mtime_ns':mtime,'size':row[-1],'kind':kind})
         if len(result)>=MAX_SOURCES: break
