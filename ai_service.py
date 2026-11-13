@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -55,6 +56,16 @@ def delete_key(target=CREDENTIAL_NAME):
         err=ctypes.get_last_error()
         if err!=1168: raise ctypes.WinError(err)
 
+def source_state(source):
+    """Check source metadata without opening or hydrating its contents."""
+    try:
+        st=os.stat(source['path'],follow_symlinks=False); attrs=getattr(st,'st_file_attributes',0)
+        if stat.S_ISLNK(st.st_mode) or attrs & core.REPARSE: return '連結或重新解析點，請重新掃描來源'
+        if attrs & core.PLACEHOLDER: return '雲端檔案尚未下載，請先自行確認同步狀態'
+        if st.st_mtime_ns != source['mtime_ns'] or st.st_size != source['size']: return '來源已變更，請重新掃描'
+    except (OSError,KeyError,TypeError): return '來源無法存取或資料不完整'
+    return ''
+
 def retrieve(db_path, question):
     question=question.strip()
     if not question or len(question)>MAX_QUESTION: raise ValueError('請輸入不超過 2000 字的問題')
@@ -79,18 +90,18 @@ def retrieve(db_path, question):
         for token in tokens:
             if len(token)>=3:
                 expression='"'+token.replace('"','""')+'"'
-                rows=db.execute('''SELECT c.id,d.path,d.status,d.sha256,c.locator,c.text,d.mtime_ns,d.detail
+                rows=db.execute('''SELECT c.id,d.path,d.status,d.sha256,c.locator,c.text,d.mtime_ns,d.detail,d.size
                   FROM search_fts f JOIN chunks c ON c.id=f.rowid JOIN documents d ON d.id=c.document_id
                   WHERE search_fts MATCH ? AND d.status='indexed' '''+brand_sql+' ORDER BY rank LIMIT 60',(expression,*brand_args)).fetchall()
-                derived=db.execute('''SELECT c.id,d.path,d.status,d.sha256,c.locator,c.text,d.mtime_ns,d.detail,c.kind
+                derived=db.execute('''SELECT c.id,d.path,d.status,d.sha256,c.locator,c.text,d.mtime_ns,d.detail,c.kind,d.size
                   FROM pdf_derived_fts f JOIN pdf_derived c ON c.id=f.rowid JOIN documents d ON d.id=c.document_id
                   WHERE pdf_derived_fts MATCH ? AND d.status='indexed' AND c.source_sha256=d.sha256 '''+brand_sql+' ORDER BY rank LIMIT 60',(expression,*brand_args)).fetchall()
             else:
                 escaped=token.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')
-                rows=db.execute('''SELECT c.id,d.path,d.status,d.sha256,c.locator,c.text,d.mtime_ns,d.detail
+                rows=db.execute('''SELECT c.id,d.path,d.status,d.sha256,c.locator,c.text,d.mtime_ns,d.detail,d.size
                   FROM chunks c JOIN documents d ON d.id=c.document_id
                   WHERE d.status='indexed' AND c.text LIKE ? ESCAPE '\\' '''+brand_sql+' ORDER BY CASE WHEN instr(c.locator,?)>0 THEN 0 ELSE 1 END LIMIT 60',('%'+escaped+'%',*brand_args,token)).fetchall()
-                derived=db.execute('''SELECT c.id,d.path,d.status,d.sha256,c.locator,c.text,d.mtime_ns,d.detail,c.kind
+                derived=db.execute('''SELECT c.id,d.path,d.status,d.sha256,c.locator,c.text,d.mtime_ns,d.detail,c.kind,d.size
                   FROM pdf_derived c JOIN documents d ON d.id=c.document_id WHERE d.status='indexed' AND c.source_sha256=d.sha256 AND c.text LIKE ? ESCAPE '\\' '''+brand_sql+' LIMIT 60',('%'+escaped+'%',*brand_args)).fetchall()
             for group,group_rows in (('original',rows),('derived',derived)):
                 for rank,row in enumerate(group_rows):
@@ -105,23 +116,31 @@ def retrieve(db_path, question):
     result=[]; per_doc={}; total=0
     for ident in sorted(scores,key=quality,reverse=True):
         row=items[ident]; _,path,status,sha,locator,text,mtime,detail=row[:8]
-        try:
-            if os.stat(path,follow_symlinks=False).st_mtime_ns != mtime: continue
-        except OSError: continue
+        if source_state({'path':path,'mtime_ns':mtime,'size':row[-1]}): continue
         if 'prompt' in Path(path).name.lower() or '提示詞' in Path(path).name: continue
         if brands and not any(brand in (path+' '+text).lower() for brand in brands): continue
         nonbrand=[t.lower() for t in tokens if t.lower() not in brands]
         if brands and nonbrand and not any(t in (text+' '+locator).lower() for t in nonbrand): continue
         if per_doc.get(path,0)>=2: continue
-        # Bring the strongest term into view instead of always taking the start of a long section.
-        lower=text.lower(); positions=[lower.find(t.lower()) for t in tokens if lower.find(t.lower())>=0]
-        pos=min(positions) if positions else 0; start=max(0,pos-350); excerpt=text[start:start+MAX_EXCERPT]
+        # Prefer a window containing question terms over an early brand-only mention.
+        lower=text.lower(); terms=[t.lower() for t in tokens if t.lower() not in brands]
+        starts={0}
+        for term in terms:
+            at=0
+            for _ in range(16):
+                pos=lower.find(term,at)
+                if pos<0: break
+                starts.add(max(0,pos-350)); at=pos+len(term)
+        def window_score(start):
+            window=lower[start:start+MAX_EXCERPT]
+            return (sum(min(len(term),6) for term in terms if term in window),-start)
+        start=max(starts,key=window_score); excerpt=text[start:start+MAX_EXCERPT]
         if not excerpt.strip(): continue
         remaining=MAX_CONTEXT-total
         if remaining<200: break
         excerpt=excerpt[:remaining]; total+=len(excerpt); per_doc[path]=per_doc.get(path,0)+1
-        kind=({'ocr':'PDF OCR 衍生文字（使用者校對，可能有誤）','table':'PDF 表格擷取（使用者校對，可能有誤）','scanned_table':'PDF 掃描表格 OCR（使用者校對，欄位可能錯置）'}.get(row[8],'PDF 衍生內容（可能有誤）')) if len(row)>8 else detail if detail in core.AI_REVIEW_STATES else '使用者知識卡' if detail=='使用者知識卡；非原始文件' else '來源文件（部分頁面擷取失敗）' if '擷取失敗' in detail else '來源文件（來源可信度未確認）'
-        result.append({'id':len(result)+1,'path':path,'locator':locator,'excerpt':excerpt,'sha256':sha,'mtime_ns':mtime,'kind':kind})
+        kind=({'ocr':'PDF OCR 衍生文字（使用者校對，可能有誤）','table':'PDF 表格擷取（使用者校對，可能有誤）','scanned_table':'PDF 掃描表格 OCR（使用者校對，欄位可能錯置）'}.get(row[8],'PDF 衍生內容（可能有誤）')) if len(row)>9 else detail if detail in core.AI_REVIEW_STATES else '使用者知識卡' if detail=='使用者知識卡；非原始文件' else '來源文件（部分頁面擷取失敗）' if '擷取失敗' in detail else '來源文件（來源可信度未確認）'
+        result.append({'id':len(result)+1,'path':path,'locator':locator,'excerpt':excerpt,'sha256':sha,'mtime_ns':mtime,'size':row[-1],'kind':kind})
         if len(result)>=MAX_SOURCES: break
     return result
 

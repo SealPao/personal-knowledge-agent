@@ -231,13 +231,14 @@ class AIWindow(tk.Toplevel):
 
     def send(self,w,q,sources,approved=None):
         w.destroy(); self.status.set('正在等待模型回答…'); config=read_config(self.config_path)
-        if approved is not None and any(config.get(k)!=approved.get(k) for k in ('provider','local_base','openai_model','local_model','network_enabled')):
+        if approved is not None and any(config.get(k)!=approved.get(k) for k in ('provider','local_base','openai_model','local_model','network_enabled','max_tokens')):
             self._set_busy(False); self.status.set('AI 設定已變更，未傳送資料；請重新提問並檢查預覽。'); return
         if config['provider']=='openai' and not config['network_enabled']:
             self._set_busy(False); self.status.set('外網存取已關閉，未傳送問題或片段。'); return
         def work():
             ticket=None
             try:
+                if any(svc.source_state(source) for source in sources): raise ValueError('來源在預覽後已變更或無法存取，未傳送；請重新掃描並提問。')
                 key=svc.load_key() if config['provider']=='openai' else None
                 if config['provider']=='openai': ticket=budget.reserve(self.db,q,sources,config['openai_model'],config['max_tokens'])
                 result=svc.answer(q,sources,config['provider'],config['openai_model'] if config['provider']=='openai' else config['local_model'],key,config['local_base'],config['max_tokens'],network_enabled=config['network_enabled'])
@@ -299,13 +300,14 @@ class AIWindow(tk.Toplevel):
         selected=self.cites.selection()
         if not selected: return
         s=self.sources_by_row[int(selected[0])]
-        try: stale=os.stat(s['path']).st_mtime_ns!=s['mtime_ns']
-        except OSError: stale=True
-        self._source_text(('來源已變更或無法存取。\n' if stale else '')+s['path']+'\n'+s['locator']+'\n\n'+s['excerpt'])
+        state=svc.source_state(s)
+        self._source_text((state+'。\n' if state else '')+s['path']+'\n'+s['locator']+'\n\n'+s['excerpt'])
     def open_source(self):
         selected=self.cites.selection()
         if not selected: return
-        try: os.startfile(self.sources_by_row[int(selected[0])]['path'])
+        source=self.sources_by_row[int(selected[0])]; state=svc.source_state(source)
+        if state: messagebox.showwarning('來源目前無法開啟',state,parent=self); return
+        try: os.startfile(source['path'])
         except OSError as e: messagebox.showerror('無法開啟來源',str(e),parent=self)
     def close(self):
         if self.busy:

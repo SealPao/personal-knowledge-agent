@@ -1,8 +1,10 @@
 import json
 import os
+import queue
 import tempfile
 import unittest
 import threading
+from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -28,6 +30,37 @@ class AITests(unittest.TestCase):
     def test_changed_source_is_not_sent(self):
         (self.source/'BOOX 操作手冊.md').write_text('來源已變更',encoding='utf-8')
         self.assertFalse(ai.retrieve(str(self.db),'BOOX Wi-Fi'))
+    def test_changed_size_is_excluded_even_if_timestamp_restored(self):
+        path=self.source/'BOOX 操作手冊.md'; before=path.stat()
+        path.write_text('BOOX Wi-Fi '+('新資料'*30),encoding='utf-8')
+        os.utime(path,ns=(before.st_atime_ns,before.st_mtime_ns))
+        self.assertFalse(ai.retrieve(str(self.db),'BOOX Wi-Fi'))
+    def test_placeholder_or_reparse_source_is_not_used(self):
+        original=os.stat; path=self.source/'BOOX 操作手冊.md'
+        for flag in (core.PLACEHOLDER,core.REPARSE):
+            def fake(value,*args,**kwargs):
+                s=original(value,*args,**kwargs)
+                if str(value)==str(path): return SimpleNamespace(st_mode=s.st_mode,st_mtime_ns=s.st_mtime_ns,st_size=s.st_size,st_file_attributes=flag)
+                return s
+            with patch.object(ai.os,'stat',side_effect=fake):
+                self.assertFalse(ai.retrieve(str(self.db),'BOOX Wi-Fi'))
+    def test_long_chunk_excerpt_prioritizes_answer_over_early_brand(self):
+        path=self.source/'BOOX 長文件.md'
+        path.write_text('# 設定\nBOOX 手冊前言。'+'無關內容'*1200+'\n重置入口在系統選單。',encoding='utf-8')
+        core.scan(str(self.source),str(self.db))
+        refs=ai.retrieve(str(self.db),'BOOX 重置入口在哪裡')
+        match=[r for r in refs if r['path']==str(path)]
+        self.assertTrue(match); self.assertIn('重置入口在系統選單',match[0]['excerpt'])
+    def test_source_changed_after_preview_is_not_sent(self):
+        refs=ai.retrieve(str(self.db),'BOOX Wi-Fi'); path=self.source/'BOOX 操作手冊.md'
+        path.write_text('BOOX 更新後的 Wi-Fi 操作',encoding='utf-8')
+        config=dict(ai_ui.DEFAULT,provider='local',local_model='fake')
+        window=SimpleNamespace(status=SimpleNamespace(set=lambda _:None),config_path=Path(self.tmp.name)/'settings',
+            db=self.db,events=queue.Queue(),_set_busy=lambda _:None)
+        with patch.object(ai_ui,'read_config',return_value=config),patch.object(ai,'answer') as send:
+            ai_ui.AIWindow.send(window,SimpleNamespace(destroy=lambda:None),'BOOX Wi-Fi',refs,config)
+            kind,message=window.events.get(timeout=5)
+            self.assertEqual(kind,'error'); self.assertIn('未傳送',message); send.assert_not_called()
     @unittest.skipUnless(os.name=='nt','Windows character conversion required')
     def test_retrieve_simplified_question_from_traditional_source(self):
         refs=ai.retrieve(str(self.db),'Kobo 阅读器充电')
