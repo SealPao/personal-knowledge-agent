@@ -48,6 +48,23 @@ def indexed_card_copy(db_path,path,limit=100000):
         return ('來源檔案：'+str(path)+'\n來源索引 SHA-256：'+str(doc[5] or '未提供')
                 +'\n這是由索引文字建立的獨立工作副本，不會自動隨來源更新；可能缺少圖片或格式，衍生內容可能有誤，請核對。'+notice+''.join(pieces))
 
+def _import_one(db_path,path,retry_target=''):
+    target=retry_target
+    try:
+        target,created=(core.retry_import_copy(str(db_path),retry_target,path) if retry_target else core.import_copy(str(db_path),path))
+        with closing(core.connect(str(db_path))) as db:
+            row=db.execute('''SELECT d.status,d.detail,EXISTS(SELECT 1 FROM chunks c WHERE c.document_id=d.id)
+                FROM documents d WHERE d.path=?''',(str(target),)).fetchone()
+        if not row: raise ValueError('副本已寫入，但索引紀錄無法確認')
+        status,detail,has_text=row
+        if not created: state='已有副本'
+        elif status!='indexed': state='副本已保存，解析失敗'
+        elif not has_text: state='副本已保存，沒有可搜尋文字'
+        else: state='匯入成功'
+        return {'source':str(path),'state':state,'detail':detail,'target':str(target)}
+    except Exception as e:
+        return {'source':str(path),'state':'未完成','detail':str(e),'target':str(target)}
+
 def import_batch(db_path,paths,cancelled=lambda:False,progress=lambda _:None):
     """Return a per-file outcome, including copied files whose parsing failed."""
     results=[]; paths=list(paths); total=len(paths)
@@ -55,21 +72,19 @@ def import_batch(db_path,paths,cancelled=lambda:False,progress=lambda _:None):
         if cancelled():
             results.extend({'source':str(p),'state':'未處理','detail':'使用者已取消','target':''} for p in paths[index:]); break
         if index==0 or index%10==0: progress(f'正在匯入 {index+1} / {total}：{Path(path).name}')
-        target=''
-        try:
-            target,created=core.import_copy(str(db_path),path)
-            with closing(core.connect(str(db_path))) as db:
-                row=db.execute('''SELECT d.status,d.detail,EXISTS(SELECT 1 FROM chunks c WHERE c.document_id=d.id)
-                    FROM documents d WHERE d.path=?''',(str(target),)).fetchone()
-            if not row: raise ValueError('副本已寫入，但索引紀錄無法確認')
-            status,detail,has_text=row
-            if not created: state='已有副本'
-            elif status!='indexed': state='副本已保存，解析失敗'
-            elif not has_text: state='副本已保存，沒有可搜尋文字'
-            else: state='匯入成功'
-            results.append({'source':str(path),'state':state,'detail':detail,'target':str(target)})
-        except Exception as e:
-            results.append({'source':str(path),'state':'未完成','detail':str(e),'target':str(target)})
+        results.append(_import_one(db_path,path))
+    return results
+
+def retry_import_batch(db_path,previous,cancelled=lambda:False,progress=lambda _:None):
+    """Retry failed or cancelled items while keeping successful outcomes."""
+    results=[dict(item) for item in previous]
+    targets=[i for i,item in enumerate(results) if item['state'] in ('副本已保存，解析失敗','未完成','未處理')]
+    for number,index in enumerate(targets,1):
+        if cancelled(): break
+        item=results[index]; progress(f'正在重試 {number} / {len(targets)}：{Path(item["source"]).name}')
+        # A saved copy is re-parsed in place; no new copy is created.
+        retry_target=item['target'] if item['target'] else ''
+        results[index]=_import_one(db_path,item['source'],retry_target)
     return results
 
 class DocumentWindow(tk.Toplevel):
@@ -164,7 +179,18 @@ class DocumentWindow(tk.Toplevel):
         if not self.import_results: messagebox.showinfo('尚無匯入結果','此視窗尚未執行匯入。',parent=self); return
         w=tk.Toplevel(self); w.title('最近匯入結果'); w.geometry('820x580'); w.configure(bg=WHITE)
         label(w,'最近匯入結果',font=(FONT,15,'bold')).pack(anchor='w',padx=18,pady=(16,4))
-        label(w,'解析失敗的副本仍保存在 APP；沒有可搜尋文字的文件可能需要 OCR。',fg=MUTED,wraplength=760,justify='left').pack(anchor='w',padx=18)
+        label(w,'解析失敗的副本仍保存在 APP；沒有可搜尋文字的文件可能需要 OCR。重試只處理失敗或未處理項目。',fg=MUTED,wraplength=760,justify='left').pack(anchor='w',padx=18)
+        actions=tk.Frame(w,bg=WHITE); actions.pack(side='bottom',fill='x',padx=18,pady=(0,14))
+        def retry():
+            if self.importing: messagebox.showinfo('處理中','請等待目前作業完成。',parent=w); return
+            if not any(item['state'] in ('副本已保存，解析失敗','未完成','未處理') for item in self.import_results):
+                messagebox.showinfo('沒有待重試項目','沒有解析失敗或未處理的項目；無文字文件可使用 OCR。',parent=w); return
+            previous=[dict(item) for item in self.import_results]; self.importing=True; self.cancel.clear(); self.summary.set('正在重試未完成項目…'); w.destroy()
+            def work():
+                try: self.events.put(('import',retry_import_batch(self.db_path,previous,self.cancel.is_set,lambda text:self.events.put(('progress',text)))))
+                except Exception as e: self.events.put(('error',str(e)))
+            threading.Thread(target=work,daemon=True).start()
+        button(actions,'重試未完成項目',retry,True).pack(side='right')
         area=tk.Frame(w,bg=WHITE); area.pack(fill='both',expand=True,padx=18,pady=12)
         text=tk.Text(area,wrap='word',font=(FONT,10),fg=INK,bg='#f8fafc',bd=0,padx=10,pady=10)
         scroll=ttk.Scrollbar(area,command=text.yview); text.configure(yscrollcommand=scroll.set); text.pack(side='left',fill='both',expand=True); scroll.pack(side='right',fill='y')

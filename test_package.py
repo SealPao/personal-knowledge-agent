@@ -10,6 +10,8 @@ import core
 import package_service as package
 import workspace
 import budget
+import document_ui
+from unittest.mock import patch
 
 class PackageTests(unittest.TestCase):
     def setUp(self):
@@ -39,6 +41,15 @@ class PackageTests(unittest.TestCase):
         finally: db.close()
         restored_copy=next(path for path in paths if core.contained(path,restored/'data'/'imported'))
         self.assertEqual(restored_copy.read_bytes(),before); self.assertEqual((restored/'source'/'manual.md').read_bytes(),before)
+        self.assertEqual(original.read_bytes(),before)
+    def test_retried_import_survives_backup_restore(self):
+        original=self.base/'incoming.txt'; original.write_text('重試後的獨立說明',encoding='utf8'); before=original.read_bytes()
+        with patch.object(core,'parse',side_effect=ValueError('暫時無法解析')):
+            outcomes=document_ui.import_batch(self.db,[original])
+        self.assertEqual(outcomes[0]['state'],'副本已保存，解析失敗')
+        retried=document_ui.retry_import_batch(self.db,outcomes); self.assertEqual(retried[0]['state'],'匯入成功')
+        package.create_package(self.db,self.file); restored,_,_=package.restore_package(self.file,self.base,self.source)
+        self.assertTrue(core.search(str(restored/'data'/'knowledge.sqlite3'),'重試後的獨立說明'))
         self.assertEqual(original.read_bytes(),before)
     def test_export_does_not_overwrite_or_write_source(self):
         with self.assertRaises(ValueError): package.create_package(self.db,self.source/'backup.pka')

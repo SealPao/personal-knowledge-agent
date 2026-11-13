@@ -355,6 +355,38 @@ def import_copy(db_path, source):
         return str(target),True
     finally: db.close()
 
+def retry_import_copy(db_path,target,source_label):
+    """Re-parse an unchanged APP-owned import; never rewrite the file."""
+    db_path=Path(db_path).resolve(); folder=db_path.parent/'imported'; target=Path(target)
+    if target.parent.resolve()!=folder.resolve() or target.suffix.lower() not in SUPPORTED:
+        raise ValueError('只能重新解析 APP 管理的匯入副本')
+    if not re.fullmatch(r'[0-9a-f]{32}(?:--.+)?\.[A-Za-z0-9]+',target.name): raise ValueError('匯入副本名稱無效')
+    db=connect(str(db_path))
+    try:
+        root=db.execute("SELECT value FROM settings WHERE key='root'").fetchone()
+        if not root or contained(folder,root[0]): raise ValueError('匯入區不可位於原始來源中')
+        folder_st=os.stat(folder,follow_symlinks=False)
+        if stat.S_ISLNK(folder_st.st_mode) or getattr(folder_st,'st_file_attributes',0)&REPARSE: raise ValueError('匯入資料夾不能是重新解析點')
+        row=db.execute('SELECT status,sha256 FROM documents WHERE path=?',(str(target),)).fetchone()
+        if not row or row[0]!='error' or not row[1]: raise ValueError('只有解析失敗且有雜湊的匯入副本可以重試')
+        before=os.stat(target,follow_symlinks=False); attrs=getattr(before,'st_file_attributes',0)
+        if not stat.S_ISREG(before.st_mode) or attrs & (PLACEHOLDER|REPARSE) or before.st_size>MAX_SIZE:
+            raise ValueError('匯入副本無法安全讀取')
+        with open(target,'rb') as f: data=f.read(MAX_SIZE+1)
+        after=os.stat(target,follow_symlinks=False)
+        if (len(data)>MAX_SIZE or not stat.S_ISREG(after.st_mode) or getattr(after,'st_file_attributes',0)&(PLACEHOLDER|REPARSE)
+                or before.st_size!=after.st_size or before.st_mtime_ns!=after.st_mtime_ns or hashlib.sha256(data).hexdigest()!=row[1]):
+            raise ValueError('匯入副本已變更，未重新解析；請重新選擇來源匯入')
+        prefix='手動匯入副本；原始路徑：'+str(source_label)+'；'
+        try:
+            chunks,detail=parse(target,data)
+            if not chunks: detail+='；未擷取到可搜尋文字'
+            _record(db,str(target),target.suffix.lower(),after.st_size,after.st_mtime_ns,row[1],'indexed',prefix+detail,chunks)
+        except Exception as e:
+            _record(db,str(target),target.suffix.lower(),after.st_size,after.st_mtime_ns,row[1],'error',prefix+str(e),[])
+        return str(target),True
+    finally: db.close()
+
 def save_card(db_path, title, content, existing=None):
     """Save a user-edited card outside the source and index it as a separate document."""
     title=title.strip(); content=content.strip()

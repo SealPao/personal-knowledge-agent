@@ -63,5 +63,29 @@ class DocumentManagementTests(unittest.TestCase):
         b=self.root/'b.txt'; b.write_text('第二份內容',encoding='utf8')
         count=iter((False,True)); items=document_ui.import_batch(self.db,[a,b],cancelled=lambda:next(count))
         self.assertEqual([x['state'] for x in items],['匯入成功','未處理']); self.assertTrue(b.exists())
+    def test_retry_reparses_existing_copy_without_reading_or_changing_original(self):
+        source=self.root/'bad.txt'; source.write_text('可恢復的操作步驟',encoding='utf8'); before=source.read_bytes()
+        with patch.object(core,'parse',side_effect=ValueError('模擬暫時性解析失敗')):
+            results=document_ui.import_batch(self.db,[source])
+        self.assertEqual(results[0]['state'],'副本已保存，解析失敗'); target=Path(results[0]['target']); copy_before=target.read_bytes()
+        original_open=open
+        def guarded(path,*args,**kwargs):
+            if str(path)==str(source): raise AssertionError('重試不應讀取原始文件')
+            return original_open(path,*args,**kwargs)
+        with patch('builtins.open',side_effect=guarded): retried=document_ui.retry_import_batch(self.db,results)
+        self.assertEqual(retried[0]['state'],'匯入成功'); self.assertEqual(retried[0]['target'],str(target))
+        self.assertEqual(target.read_bytes(),copy_before); self.assertEqual(source.read_bytes(),before)
+        self.assertEqual(len(list((self.db.parent/'imported').glob('*.txt'))),1)
+        self.assertTrue(core.search(str(self.db),'可恢復的操作步驟'))
+    def test_retry_rejects_changed_copy_without_creating_new_files(self):
+        source=self.root/'bad.txt'; source.write_text('原始內容',encoding='utf8')
+        with patch.object(core,'parse',side_effect=ValueError('模擬失敗')): results=document_ui.import_batch(self.db,[source])
+        target=Path(results[0]['target']); before=target.stat(); data=target.read_bytes(); target.write_bytes(bytes([data[0]^1])+data[1:]); os.utime(target,ns=(before.st_atime_ns,before.st_mtime_ns))
+        changed=target.read_bytes(); retried=document_ui.retry_import_batch(self.db,results)
+        self.assertEqual(retried[0]['state'],'未完成'); self.assertIn('已變更',retried[0]['detail'])
+        self.assertEqual(target.read_bytes(),changed); self.assertEqual(len(list((self.db.parent/'imported').glob('*.txt'))),1)
+    def test_retry_cancellation_preserves_other_outcomes(self):
+        previous=[{'source':'a','state':'匯入成功','detail':'ok','target':'a'}, {'source':'b','state':'未處理','detail':'已取消','target':''}]
+        self.assertEqual(document_ui.retry_import_batch(self.db,previous,cancelled=lambda:True),previous)
 
 if __name__=='__main__': unittest.main()
