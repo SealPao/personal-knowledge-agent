@@ -88,6 +88,32 @@ with import_history.batch_lock(db,batch),import_history.ImportHistory(db) as his
             self.assertEqual([row[0] for row in history.batches()],[second,first])
             self.assertEqual(history.load(first)[0]['source'],str(self.incoming))
             self.assertEqual(history.load(second)[0]['source'],str(self.manual))
+    def test_selected_retry_leaves_unselected_items_and_sources_untouched(self):
+        other=self.root/'other.txt'; other.write_text('另一份操作',encoding='utf8'); other_before=other.read_bytes()
+        with import_history.ImportHistory(self.db) as history:
+            batch=history.create([self.incoming,other])
+            with patch.object(core,'parse',side_effect=ValueError('暫時失敗')):
+                document_ui.import_batch(self.db,[self.incoming,other],on_item=lambda i,item:history.update(batch,i,item))
+            items=history.load(batch); untouched=dict(items[1]); original_open=open
+            def guarded(path,*args,**kwargs):
+                if str(path) in (str(other),untouched['target']): raise AssertionError('不可處理未選項目')
+                return original_open(path,*args,**kwargs)
+            with patch('builtins.open',side_effect=guarded):
+                document_ui.retry_import_batch(self.db,items,on_item=lambda i,item:history.update(batch,i,item),positions=[0])
+            after=history.load(batch); self.assertEqual(after[0]['state'],'匯入成功'); self.assertEqual(after[1],untouched)
+            self.assertEqual([event[2] for event in history.events(batch)],['副本已保存，解析失敗','副本已保存，解析失敗','匯入成功'])
+        self.assertEqual(other.read_bytes(),other_before); self.assertEqual(self.manual.read_bytes(),self.before)
+    def test_cancel_marks_only_selected_pending_items(self):
+        with import_history.ImportHistory(self.db) as history:
+            batch=history.create([self.incoming,self.manual]); before=history.load(batch)
+            history.cancel_pending(batch,positions=[1]); after=history.load(batch)
+            self.assertEqual(after[0],before[0]); self.assertIn('已取消',after[1]['detail'])
+            self.assertEqual(len(history.events(batch)),1)
+    def test_invalid_selected_positions_rejected(self):
+        item={'source':'x','state':'未處理','detail':'','target':''}
+        for positions in ([],[-1],[1],[True]):
+            with self.subTest(positions=positions),self.assertRaises(ValueError):
+                document_ui.retry_import_batch(self.db,[item],positions=positions)
     def test_viewing_pending_history_does_not_open_source(self):
         original_open=open
         def guarded(path,*args,**kwargs):

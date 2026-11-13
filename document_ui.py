@@ -76,10 +76,14 @@ def import_batch(db_path,paths,cancelled=lambda:False,progress=lambda _:None,on_
         item=_import_one(db_path,path); on_item(index,item); results.append(item)
     return results
 
-def retry_import_batch(db_path,previous,cancelled=lambda:False,progress=lambda _:None,on_item=lambda index,item:None):
+def retry_import_batch(db_path,previous,cancelled=lambda:False,progress=lambda _:None,on_item=lambda index,item:None,positions=None):
     """Retry failed or cancelled items while keeping successful outcomes."""
     results=[dict(item) for item in previous]
-    targets=[i for i,item in enumerate(results) if item['state'] in ('副本已保存，解析失敗','未完成','未處理')]
+    if positions is not None:
+        positions=list(positions)
+        if not positions or any(type(i) is not int or i<0 or i>=len(results) for i in positions): raise ValueError('重試選擇無效')
+        positions=set(positions)
+    targets=[i for i,item in enumerate(results) if item['state'] in import_history.RETRY_STATES and (positions is None or i in positions)]
     for number,index in enumerate(targets,1):
         if cancelled(): break
         item=results[index]; progress(f'正在重試 {number} / {len(targets)}：{Path(item["source"]).name}')
@@ -201,18 +205,48 @@ class DocumentWindow(tk.Toplevel):
         actions=tk.Frame(w,bg=WHITE); actions.pack(side='bottom',fill='x',padx=18,pady=(0,14))
         def retry():
             if self.importing: messagebox.showinfo('處理中','請等待目前作業完成。',parent=w); return
-            if not any(item['state'] in import_history.RETRY_STATES and not item.get('target_missing') for item in current['items']):
+            snapshot=[dict(item) for item in current['items']]
+            eligible=[(i,item) for i,item in enumerate(snapshot) if item['state'] in import_history.RETRY_STATES and not item.get('target_missing')]
+            if not eligible:
                 messagebox.showinfo('沒有可重試項目','沒有可重試項目；若副本無法存取，請檢查知識庫或重新選擇來源。無文字文件可使用 OCR。',parent=w); return
-            batch=current['id']; self.importing=True; self.cancel.clear(); self.summary.set('正在重試未完成項目…'); w.destroy()
-            def work():
-                try:
-                    with import_history.batch_lock(self.db_path,batch),import_history.ImportHistory(self.db_path) as history:
-                        previous=history.load(batch)
-                        retry_import_batch(self.db_path,previous,self.cancel.is_set,lambda text:self.events.put(('progress',text)),lambda i,item:history.update(batch,i,item))
-                        if self.cancel.is_set(): history.cancel_pending(batch)
-                        self.events.put(('import',(batch,history.load(batch))))
-                except Exception as e: self.events.put(('error',str(e)))
-            threading.Thread(target=work,daemon=True).start()
+            batch=current['id']; choose=tk.Toplevel(w); choose.title('選擇重試項目'); choose.geometry('980x580'); choose.configure(bg=WHITE); choose.transient(w); choose.grab_set()
+            label(choose,'選擇要重試的項目',font=(FONT,15,'bold')).pack(anchor='w',padx=18,pady=(14,4))
+            label(choose,'按住 Ctrl 或 Shift 可複選；也可按「全選」。原來源會讀取當前內容，請核對路徑。',fg=MUTED,wraplength=920,justify='left').pack(anchor='w',padx=18)
+            selection_info=tk.StringVar(value='尚未選擇項目。'); label(choose,textvariable=selection_info,fg=MUTED).pack(anchor='w',padx=18,pady=(5,0))
+            bottom=tk.Frame(choose,bg=WHITE); bottom.pack(side='bottom',fill='x',padx=18,pady=(0,14))
+            area=tk.Frame(choose,bg=WHITE); area.pack(fill='both',expand=True,padx=18,pady=10)
+            tree=ttk.Treeview(area,columns=('state','method','source','target'),show='headings',selectmode='extended')
+            for key,title,width in [('state','目前狀態',155),('method','重試方式',120),('source','原來源路徑',310),('target','APP 副本',310)]:
+                tree.heading(key,text=title); tree.column(key,width=width,minwidth=80,stretch=True)
+            scroll=ttk.Scrollbar(area,orient='vertical',command=tree.yview); horizontal=ttk.Scrollbar(area,orient='horizontal',command=tree.xview)
+            tree.configure(yscrollcommand=scroll.set,xscrollcommand=horizontal.set)
+            horizontal.pack(side='bottom',fill='x'); tree.pack(side='left',fill='both',expand=True); scroll.pack(side='right',fill='y')
+            for index,item in eligible:
+                method='解析 APP 副本' if item['target'] else '讀取原來源'
+                tree.insert('','end',iid=str(index),values=(item['state'],method,item['source'],item['target']))
+            def update_selection(event=None):
+                chosen=[int(i) for i in tree.selection()]
+                original=sum(not snapshot[i]['target'] for i in chosen)
+                selection_info.set(f'已選 {len(chosen)} 項，其中 {original} 項會讀取原來源。')
+            tree.bind('<<TreeviewSelect>>',update_selection)
+            button(bottom,'全選',lambda:tree.selection_set(tree.get_children())).pack(side='left')
+            def begin():
+                positions=[int(i) for i in tree.selection()]
+                if not positions: messagebox.showinfo('請選擇項目','請選擇至少一個要重試的項目。',parent=choose); return
+                approved={i:(snapshot[i]['source'],snapshot[i]['target']) for i in positions}
+                self.importing=True; self.cancel.clear(); self.summary.set(f'正在重試選定的 {len(positions)} 個項目…'); w.destroy()
+                def work():
+                    try:
+                        with import_history.batch_lock(self.db_path,batch),import_history.ImportHistory(self.db_path) as history:
+                            previous=history.load(batch)
+                            if any(i>=len(previous) or previous[i].get('target_missing') or (previous[i]['source'],previous[i]['target'])!=approved[i] for i in positions):
+                                raise ValueError('所選項目的來源或副本狀態已變更；請重新查看並選擇。')
+                            retry_import_batch(self.db_path,previous,self.cancel.is_set,lambda text:self.events.put(('progress',text)),lambda i,item:history.update(batch,i,item),positions=positions)
+                            if self.cancel.is_set(): history.cancel_pending(batch,positions=positions)
+                            self.events.put(('import',(batch,history.load(batch))))
+                    except Exception as e: self.events.put(('error',str(e)))
+                threading.Thread(target=work,daemon=True).start()
+            button(bottom,'重試所選',begin,True).pack(side='right')
         def show_attempts():
             try:
                 with import_history.ImportHistory(self.db_path) as history: events=history.events(current['id'])
@@ -226,7 +260,7 @@ class DocumentWindow(tk.Toplevel):
             if not events: box.insert('end','尚無已完成的處理嘗試。')
             box.configure(state='disabled')
         button(actions,'查看嘗試歷程',show_attempts).pack(side='left')
-        button(actions,'重試未完成項目',retry,True).pack(side='right')
+        button(actions,'選擇重試項目',retry,True).pack(side='right')
         area=tk.Frame(w,bg=WHITE); area.pack(fill='both',expand=True,padx=18,pady=12)
         text=tk.Text(area,wrap='word',font=(FONT,10),fg=INK,bg='#f8fafc',bd=0,padx=10,pady=10)
         scroll=ttk.Scrollbar(area,command=text.yview); text.configure(yscrollcommand=scroll.set); text.pack(side='left',fill='both',expand=True); scroll.pack(side='right',fill='y')

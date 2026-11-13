@@ -76,12 +76,20 @@ class ImportHistory:
         return self.db.execute('''SELECT b.id,b.created_at,b.updated_at,COUNT(i.position)
             FROM import_batches b LEFT JOIN import_batch_items i ON i.batch_id=b.id
             GROUP BY b.id ORDER BY b.rowid DESC''').fetchall()
-    def cancel_pending(self,batch_id):
+    def cancel_pending(self,batch_id,positions=None):
+        if positions is not None:
+            positions=list(positions)
+            if any(type(i) is not int or i<0 for i in positions): raise ValueError('取消項目無效')
+            groups=[positions[i:i+400] for i in range(0,len(positions),400)]
+        else: groups=[None]
         with self.db:
-            self.db.execute("""INSERT INTO import_item_events(batch_id,position,recorded_at,state,detail)
-                SELECT batch_id,position,datetime('now','localtime'),'未處理','使用者已取消，尚未處理'
-                FROM import_batch_items WHERE batch_id=? AND state='未處理'""",(batch_id,))
-            self.db.execute("UPDATE import_batch_items SET detail='使用者已取消，尚未處理' WHERE batch_id=? AND state='未處理'",(batch_id,))
+            for group in groups:
+                clause='' if group is None else ' AND position IN ('+','.join('?' for _ in group)+')'
+                params=(batch_id,*(group or []))
+                self.db.execute("""INSERT INTO import_item_events(batch_id,position,recorded_at,state,detail)
+                    SELECT batch_id,position,datetime('now','localtime'),'未處理','使用者已取消，尚未處理'
+                    FROM import_batch_items WHERE batch_id=? AND state='未處理'"""+clause,params)
+                self.db.execute("UPDATE import_batch_items SET detail='使用者已取消，尚未處理' WHERE batch_id=? AND state='未處理'"+clause,params)
             self.db.execute("UPDATE import_batches SET updated_at=datetime('now','localtime') WHERE id=?",(batch_id,))
     def events(self,batch_id):
         return self.db.execute('''SELECT e.recorded_at,i.source,e.state,e.detail FROM import_item_events e
