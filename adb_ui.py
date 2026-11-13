@@ -61,7 +61,7 @@ def show_result(parent,answer,images,saved):
 class DeviceWindow(tk.Toplevel):
     def __init__(self,master,db,initial_goal=''):
         super().__init__(master); self.title('閱讀器連線與紀錄'); self.geometry('780x650'); self.configure(bg=WHITE)
-        self.db=db; self.busy=False; self.events=queue.Queue(); self.png=None; self.capture_serial=None; self.rows=[]; self.agent_active=False; self.history=[]; self.images=[]; self.agent_serial=None; self.agent_config=None; self.goal=''; self.session_path=None
+        self.db=db; self.busy=False; self.events=queue.Queue(); self.png=None; self.capture_serial=None; self.rows=[]; self.agent_active=False; self.history=[]; self.images=[]; self.agent_serial=None; self.agent_config=None; self.goal=''; self.session_path=None; self.agent_cancel=threading.Event()
         label(self,'閱讀器連線與紀錄',font=(FONT,16,'bold')).pack(anchor='w',padx=20,pady=(18,5))
         label(self,'AI 可根據截圖提出操作，每步確認後執行；支援點擊、滑動、返回及首頁。',fg=MUTED,wraplength=720,justify='left').pack(anchor='w',padx=20)
         row=tk.Frame(self,bg=WHITE); row.pack(fill='x',padx=20,pady=10)
@@ -82,7 +82,7 @@ class DeviceWindow(tk.Toplevel):
         button(bar,'研究 ADB 指令',self.open_research).pack(side='left')
         button(bar,'儲存紀錄並加入搜尋',self.save).pack(side='right'); button(bar,'預覽目前截圖',self.preview).pack(side='right',padx=8)
         self.note=tk.Text(self,wrap='word',font=(FONT,11),bg='#f8fafc',bd=1,padx=8,pady=8); self.note.pack(fill='both',expand=True,padx=20,pady=6)
-        self.after(150,self.poll); self.protocol('WM_DELETE_WINDOW',self.close)
+        self.poll_id=self.after(150,self.poll); self.protocol('WM_DELETE_WINDOW',self.close)
     def work(self,kind,fn):
         if self.busy: return
         self.busy=True; self.status.set('正在連線，請稍候…')
@@ -122,7 +122,7 @@ class DeviceWindow(tk.Toplevel):
             return rows,target,adb_service.screenshot(target[0]) if target else None
         self.work('quick_ready',prepare)
     def stop_agent(self):
-        self.agent_active=False; self.note.insert('end','\n探索已由使用者停止；未完成的目標尚待確認。\n')
+        self.agent_cancel.set(); self.agent_active=False; self.note.insert('end','\n探索已由使用者停止；未完成的目標尚待確認。\n')
         self.checkpoint(); self.status.set('已要求停止；執行中的連線結束後不會繼續操作。')
     def checkpoint(self,reviewed=False):
         if not self.images or not self.goal: return True
@@ -149,7 +149,7 @@ class DeviceWindow(tk.Toplevel):
         approved=messagebox.askyesno('確認傳送畫面',f'開始後會把目標、操作紀錄、每一步截圖及啟用時的畫面 OCR 文字傳送到{destination}，畫面可能含私人資料。AI 每一步操作前均須確認；最多 10 步。確定開始嗎？',parent=overlay)
         overlay.destroy()
         if not approved: return
-        self.agent_serial=self.rows[int(selected[0])][0]; self.agent_config=dict(config); self.goal=goal; self.agent_active=True; self.history=[]; self.images=[self.png]; self.session_path=None
+        self.agent_cancel.clear(); self.agent_serial=self.rows[int(selected[0])][0]; self.agent_config=dict(config); self.goal=goal; self.agent_active=True; self.history=[]; self.images=[self.png]; self.session_path=None
         self.note.insert('end','\n操作目標：'+goal+'\n以下是已確認送出的操作；畫面觀察由 AI 產生，請校對。\n')
         self.note.insert('end','探索尚在進行；以下紀錄並不表示操作已完成。\n')
         if not self.checkpoint(): return
@@ -166,9 +166,13 @@ class DeviceWindow(tk.Toplevel):
             if use_ocr:
                 try: ocr=adb_service.screen_text(current,self.db.parent/'cache')
                 except Exception: ocr_error='畫面 OCR 無法使用，本次僅使用截圖。'
+            if self.agent_cancel.is_set(): raise RuntimeError('探索已停止，畫面未傳送至 AI。')
             key=ai_service.load_key() if config['provider']=='openai' else None; ticket=None
             try:
                 if config['provider']=='openai': ticket=budget.reserve(self.db,goal,[{'id':1,'excerpt':str(history)+'\n'+ocr}],config['openai_model'],min(800,int(config['max_tokens'])),extra_input_tokens=8192)
+                if self.agent_cancel.is_set():
+                    if ticket: budget.exclude(self.db,ticket); ticket=None
+                    raise RuntimeError('探索已停止，畫面未傳送至 AI。')
                 result=device_agent.plan(current,goal,history,config,key,screen_text=ocr)
                 if ticket: budget.finish(self.db,ticket,result[1])
                 return result[0],ocr_error
@@ -248,7 +252,13 @@ class DeviceWindow(tk.Toplevel):
                     elif self.agent_active: self.next_plan()
                     else: self.status.set('已停止。請檢查並儲存紀錄。')
         except queue.Empty: pass
-        if self.winfo_exists(): self.after(150,self.poll)
+        if self.winfo_exists(): self.poll_id=self.after(150,self.poll)
     def close(self):
         if self.busy: messagebox.showinfo('處理中','請等待 ADB 操作結束。',parent=self); return
         self.destroy()
+    def destroy(self):
+        if getattr(self,'poll_id',None):
+            try: self.after_cancel(self.poll_id)
+            except tk.TclError: pass
+            self.poll_id=None
+        super().destroy()

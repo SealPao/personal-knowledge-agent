@@ -13,8 +13,8 @@ class LocalModelTests(unittest.TestCase):
     def test_download_verifies_and_resumes_completed_file(self):
         files=(('text.gguf',4,hashlib.sha256(b'text').hexdigest()),('vision.gguf',6,hashlib.sha256(b'vision').hexdigest()))
         calls=[]
-        def response(url,timeout):
-            calls.append(url)
+        def response(request,timeout):
+            url=request.full_url; calls.append(url)
             return io.BytesIO(b'text' if url.endswith('/text.gguf') else b'vision')
         with tempfile.TemporaryDirectory() as td,patch.object(local_ai,'FILES',files),patch.object(local_ai.urllib.request,'urlopen',side_effect=response):
             root=Path(td); (root/'models').mkdir(); (root/'models'/'text.gguf').write_bytes(b'text')
@@ -27,12 +27,69 @@ class LocalModelTests(unittest.TestCase):
             root=Path(td)
             with self.assertRaises(RuntimeError): local_ai.download(root=root)
             self.assertFalse((root/'models'/'model.gguf').exists()); self.assertFalse((root/'models'/'model.gguf.download').exists())
-    def test_cancel_cleans_partial(self):
+    def test_cancel_preserves_partial_for_resume(self):
         files=(('model.gguf',4,hashlib.sha256(b'good').hexdigest()),)
         with tempfile.TemporaryDirectory() as td,patch.object(local_ai,'FILES',files),patch.object(local_ai.urllib.request,'urlopen',return_value=io.BytesIO(b'good')):
             root=Path(td)
             with self.assertRaises(RuntimeError): local_ai.download(root=root,cancelled=lambda:True)
-            self.assertFalse((root/'models'/'model.gguf.download').exists())
+            self.assertTrue((root/'models'/'model.gguf.download').exists())
+    def test_resume_uses_range_and_verifies_full_contents(self):
+        files=(('model.gguf',8,hashlib.sha256(b'abcdefgh').hexdigest()),)
+        class Response(io.BytesIO):
+            status=206
+            headers={'Content-Range':'bytes 3-7/8'}
+        def response(request,timeout):
+            self.assertEqual(request.get_header('Range'),'bytes=3-')
+            return Response(b'defgh')
+        with tempfile.TemporaryDirectory() as td,patch.object(local_ai,'FILES',files),patch.object(local_ai.urllib.request,'urlopen',side_effect=response):
+            root=Path(td); (root/'models').mkdir(); (root/'models'/'model.gguf.download').write_bytes(b'abc')
+            local_ai.download(root=root)
+            self.assertEqual((root/'models'/'model.gguf').read_bytes(),b'abcdefgh')
+    def test_bad_range_never_appends_to_partial(self):
+        files=(('model.gguf',8,hashlib.sha256(b'abcdefgh').hexdigest()),)
+        class Response(io.BytesIO):
+            status=206
+            headers={'Content-Range':'bytes 0-4/8'}
+        with tempfile.TemporaryDirectory() as td,patch.object(local_ai,'FILES',files),patch.object(local_ai.urllib.request,'urlopen',return_value=Response(b'abcde')):
+            root=Path(td); (root/'models').mkdir(); part=root/'models'/'model.gguf.download'; part.write_bytes(b'abc')
+            with self.assertRaises(RuntimeError): local_ai.download(root=root)
+            self.assertEqual(part.read_bytes(),b'abc')
+    def test_server_ignoring_range_restarts_safely(self):
+        files=(('model.gguf',8,hashlib.sha256(b'abcdefgh').hexdigest()),)
+        class Response(io.BytesIO):
+            status=200
+            headers={}
+        with tempfile.TemporaryDirectory() as td,patch.object(local_ai,'FILES',files),patch.object(local_ai.urllib.request,'urlopen',return_value=Response(b'abcdefgh')):
+            root=Path(td); (root/'models').mkdir(); (root/'models'/'model.gguf.download').write_bytes(b'abc')
+            local_ai.download(root=root)
+            self.assertEqual((root/'models'/'model.gguf').read_bytes(),b'abcdefgh')
+    def test_download_lock_rejects_concurrent_request(self):
+        with tempfile.TemporaryDirectory() as td:
+            with local_ai._download_file_lock(Path(td)):
+                with self.assertRaisesRegex(RuntimeError,'另一個 APP'):
+                    with local_ai._download_file_lock(Path(td)): pass
+    def test_cancel_model_start_terminates_process(self):
+        class Process:
+            terminated=False
+            def poll(self): return None
+            def terminate(self): self.terminated=True
+            def wait(self,timeout): return 0
+        proc=Process(); calls=iter((False,True))
+        with tempfile.TemporaryDirectory() as td,patch.object(local_ai.subprocess,'Popen',return_value=proc):
+            root=Path(td); (root/'runtime').mkdir(); (root/'models').mkdir()
+            (root/'runtime'/'llama-server.exe').touch()
+            for name,_,_ in local_ai.FILES: (root/'models'/name).touch()
+            with self.assertRaises(local_ai.StartCancelled): local_ai.start(root=root,cancelled=lambda:next(calls))
+            self.assertTrue(proc.terminated); self.assertFalse(local_ai.running())
+    def test_model_status_reports_partial_and_ready_without_reading_contents(self):
+        files=(('model.gguf',8,'unused'),('vision.gguf',4,'unused'))
+        with tempfile.TemporaryDirectory() as td,patch.object(local_ai,'FILES',files):
+            root=Path(td); (root/'models').mkdir(); (root/'runtime').mkdir(); (root/'runtime'/'llama-server.exe').touch()
+            (root/'models'/'model.gguf.download').write_bytes(b'abc')
+            state=local_ai.model_status(root); self.assertFalse(state['ready']); self.assertEqual(state['present'],3); self.assertTrue(state['runtime'])
+            (root/'models'/'model.gggguf').write_bytes(b'ignored')
+            (root/'models'/'model.gguf').write_bytes(b'abcdefgh'); (root/'models'/'vision.gguf').write_bytes(b'abcd')
+            self.assertTrue(local_ai.model_status(root)['ready'])
     def test_auth_only_for_current_local_server(self):
         class Proc:
             def poll(self): return None
