@@ -1,4 +1,5 @@
 import datetime
+from decimal import Decimal
 import tempfile
 import threading
 import unittest
@@ -29,7 +30,11 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaises(ValueError): budget.reserve(self.path,'問題',self.sources,'model',100,now=self.now)
         budget.exclude(self.path,ident); self.assertTrue(budget.reserve(self.path,'問題',self.sources,'model',100,now=self.now))
     def test_simultaneous_reservations_are_serialized(self):
-        budget.save_settings(self.path,'0.0015','0','model','1','1')
+        probe=Path(self.tmp.name)/'probe.db'; core.connect(str(probe)).close()
+        budget.save_settings(probe,'0','0','model','1','1')
+        budget.reserve(probe,'問題',self.sources,'model',100,now=self.now)
+        one=budget.recent(probe)[0][5]
+        budget.save_settings(self.path,str(Decimal(one)*Decimal('1.5')/Decimal(1000000000)),'0','model','1','1')
         barrier=threading.Barrier(2); results=[]
         def work():
             barrier.wait()

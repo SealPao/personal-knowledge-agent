@@ -219,7 +219,7 @@ class AIWindow(tk.Toplevel):
         destination='OpenAI（可能產生費用）' if self.config['provider']=='openai' else '此電腦上的本地模型服務'
         lab(w,'確認使用的資料',font=(FONT,15,'bold')).pack(anchor='w',padx=20,pady=(18,5))
         lab(w,'以下問題與片段將傳送至：'+destination,fg=MUTED).pack(anchor='w',padx=20)
-        lab(w,'不會額外傳送來源路徑；片段本身可能包含路徑或其他敏感資訊，請先檢查。',fg=MUTED,font=(FONT,9)).pack(anchor='w',padx=20,pady=(2,8))
+        lab(w,'會傳送下列檔案名稱與片段，不會額外傳送完整路徑；內容可能有敏感資訊，請先檢查。',fg=MUTED,font=(FONT,9)).pack(anchor='w',padx=20,pady=(2,8))
         buttons=tk.Frame(w,bg=WHITE); buttons.pack(side='bottom',fill='x',padx=20,pady=15)
         def cancel(): w.destroy(); self._set_busy(False); self.status.set('已取消傳送。')
         approved=dict(self.config)

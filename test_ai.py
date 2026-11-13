@@ -27,6 +27,7 @@ class AITests(unittest.TestCase):
         self.assertTrue(all('Prompt' not in s['path'] for s in sources))
         payload=ai.make_input('問題',sources)
         self.assertNotIn(str(self.source),payload); self.assertNotIn('sha256',payload)
+        self.assertIn('BOOX 操作手冊.md',payload)
     def test_changed_source_is_not_sent(self):
         (self.source/'BOOX 操作手冊.md').write_text('來源已變更',encoding='utf-8')
         self.assertFalse(ai.retrieve(str(self.db),'BOOX Wi-Fi'))
