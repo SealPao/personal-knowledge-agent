@@ -249,13 +249,34 @@ def _checked_evidence(raw,sources):
     if set(ids)!={ident for ident,_ in quotes}: raise ValueError()
     return body,list(dict.fromkeys(ids)),quotes
 
-def _missing_operation_markers(body,quotes):
-    """A limited warning, not an assessment of semantic correctness."""
+def _related_source_sentences(question,sources,selected):
+    terms=[]
+    for token in re.findall(r'[A-Za-z0-9][A-Za-z0-9._+-]*|[\u3400-\u9fff]+',question.lower()):
+        if re.fullmatch(r'[\u3400-\u9fff]+',token):
+            terms.extend(token[i:i+2] for i in range(len(token)-1) if token[i:i+2] not in {'如何','怎麼','什么','什麼','請問','請教','可以','是否'})
+        elif len(token)>=3: terms.append(token)
+    terms=list(dict.fromkeys(v.lower() for term in terms for v in core.chinese_variants(term)))[:60]
+    found=[]
+    for source in sources:
+        if source.get('id') not in selected: continue
+        for sentence in re.split(r'[\n。！？!?；;]',source.get('excerpt','')):
+            if terms and any(term in sentence.lower() for term in terms): found.append(sentence)
+    return found
+
+def _missing_operation_markers(body,quotes,question='',sources=()):
+    """Warn about a few omitted terms, without claiming semantic verification."""
     checks=(('長按',('長按','按住')),('短按',('短按',)),('選擇',('選擇','點選','選取')),
             ('不要',('不要','不可','不得','請勿','切勿')),('不得',('不要','不可','不得','請勿','切勿')),
             ('不可',('不要','不可','不得','請勿','切勿')),('請勿',('不要','不可','不得','請勿','切勿')))
-    original='\n'.join(quote for _,quote in quotes)
+    selected={ident for ident,_ in quotes}
+    original='\n'.join([quote for _,quote in quotes]+_related_source_sentences(question,sources,selected))
     return [term for term,alternatives in checks if term in original and not any(word in body for word in alternatives)]
+
+def _possible_missed_steps(body,question,sources,ids):
+    uncertain=('無記載','沒有記載','並無','未提及','未記載','無法提供','無相關','資料不足','沒有相關','沒有說明','未說明','不包含','未包含','未列出','不足以')
+    if not any(term in body for term in uncertain): return False
+    action=('長按','短按','按住','按下','選擇','點選','選取','連接','開啟','滑桿','輸入','調整')
+    return any(any(word in sentence for word in action) for sentence in _related_source_sentences(question,sources,set(ids)))
 
 def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434/v1',max_tokens=800,post=_post,network_enabled=False):
     if not sources: raise ValueError('沒有找到可用的知識來源，請換一個問題或確認文件已匯入')
@@ -290,8 +311,11 @@ def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434
                     payload['messages'][0]['content']+=' 請確認 evidence 的每個 quote 是相應 excerpt 中連續、逐字的原文，且各引用都有 quote。'
                     response=post(local_endpoint(base),{'Content-Type':'application/json'},payload)
                     choices=response.get('choices') or []; text=(choices[0].get('message',{}).get('content') or '').strip() if choices else ''
-            missing=_missing_operation_markers(body,quotes)
-            warning=('⚠ 回答可能遺漏來源中的操作或限制（'+ '、'.join(missing)+'）；請核對下方片段。\n\n') if missing else ''
+            missing=_missing_operation_markers(body,quotes,question,sources)
+            alerts=[]
+            if missing: alerts.append('回答可能遺漏來源中的操作或限制（'+ '、'.join(missing)+'）')
+            if _possible_missed_steps(body,question,sources,ids): alerts.append('來源可能包含相關操作，AI 稱資料不足時仍請核對')
+            warning=('⚠ '+'；'.join(alerts)+'。請檢查右側完整來源片段。\n\n') if alerts else ''
             text=warning+body+'\n\n本回答參考的來源：'+' '.join(f'[{i}]' for i in ids)
         usage=response.get('usage',{})
     else: raise ValueError('未知的 AI 服務')

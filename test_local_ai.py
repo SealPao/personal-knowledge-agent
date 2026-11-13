@@ -158,5 +158,27 @@ class LocalModelTests(unittest.TestCase):
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
             text,_,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
         self.assertIn('回答可能遺漏',text); self.assertIn('長按',text); self.assertIn('選擇',text)
+    def test_checks_relevant_sentence_even_if_model_quotes_only_part(self):
+        sources=[{'id':1,'excerpt':'長按電源鍵，選擇關機。不要浸水。'}]
+        missing=ai_service._missing_operation_markers('按下電源鍵並選擇關機',[(1,'電源鍵，選擇關機')],'如何關機',sources)
+        self.assertIn('長按',missing); self.assertNotIn('不要',missing)
+    def test_unrelated_source_does_not_trigger_marker_warning(self):
+        sources=[{'id':1,'excerpt':'長按電源鍵，選擇關機。不要浸水。'}, {'id':2,'excerpt':'不要打開裝置。'}]
+        missing=ai_service._missing_operation_markers('長按電源鍵，選擇關機',[(1,'長按電源鍵，選擇關機')],'如何關機',sources)
+        self.assertEqual(missing,[])
+    def test_warns_when_model_claims_missing_steps_despite_relevant_action(self):
+        sources=[{'id':1,'excerpt':'裝置電源。長按電源鍵，選擇關機。'}]
+        def post(url,headers,payload):
+            content=json.dumps({'answer':'來源並無記載如何關機 [1]','citations':[1],'evidence':[{'source_id':1,'quote':'裝置電源'}]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,_,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertIn('來源可能包含相關操作',text)
+    def test_unrelated_source_does_not_trigger_missing_steps_warning(self):
+        sources=[{'id':1,'excerpt':'使用前光亮度滑桿調整。'}]
+        self.assertFalse(ai_service._possible_missed_steps('來源未記載重置會否刪除書籍','重置會清除書籍嗎',sources,[1]))
+    def test_model_did_not_include_steps_wording_triggers_check(self):
+        sources=[{'id':1,'excerpt':'長按電源鍵，選擇關機。'}]
+        self.assertTrue(ai_service._possible_missed_steps('來源並未包含具體的關機步驟','如何關機',sources,[1]))
 
 if __name__=='__main__': unittest.main()
