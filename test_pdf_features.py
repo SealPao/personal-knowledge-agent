@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-import core,pdf_features,ai_service,package_service,ocr_batch
+import core,pdf_features,ai_service,package_service,ocr_batch,document_ui
 
 pdf_features._dependencies()
 try:
@@ -38,6 +38,8 @@ class PDFFeatureTests(unittest.TestCase):
         text,count=pdf_features.extract_tables(raw,1); self.assertGreaterEqual(count,1); self.assertIn('READER',text); self.assertIn('5 VOLTS',text)
         locator=pdf_features.save_derivative(self.db,str(self.pdf),sha,1,'table',text)
         hits=core.search(str(self.db),'5 VOLTS'); self.assertTrue(any('擷取表格' in h[3] for h in hits)); self.assertIn('第 1 頁',locator)
+        copied=document_ui.indexed_card_copy(self.db,self.pdf)
+        self.assertIn('已校對的 PDF 衍生文字',copied); self.assertIn('5 VOLTS',copied); self.assertIn(sha,copied)
         package=self.base/'backup.pka'; package_service.create_package(self.db,package); restored,_,_=package_service.restore_package(package,self.base,self.src)
         self.assertTrue(any('擷取表格' in h[3] for h in core.search(str(restored/'data'/'knowledge.sqlite3'),'5 VOLTS')))
         self.assertEqual(self.original,self.pdf.read_bytes())

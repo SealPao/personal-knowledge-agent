@@ -9,6 +9,7 @@ from tkinter import ttk, messagebox, filedialog
 from contextlib import closing
 from pathlib import Path
 import core
+import ai_service
 import package_service
 import workspace
 
@@ -19,10 +20,38 @@ def label(parent,text='',**kw):
 def button(parent,text,command,primary=False):
     return tk.Button(parent,text=text,command=command,bd=0,padx=14,pady=7,cursor='hand2',font=(FONT,10,'bold'),bg=BLUE if primary else '#e9f0fb',fg=WHITE if primary else '#1d4ed8')
 
+def indexed_card_copy(db_path,path,limit=100000):
+    """Read indexed text only; never open or modify the source document."""
+    with closing(core.connect(str(db_path))) as db:
+        doc=db.execute('SELECT id,status,detail,mtime_ns,size,sha256 FROM documents WHERE path=?',(str(path),)).fetchone()
+        if not doc or doc[1]!='indexed': raise ValueError('文件目前沒有可用索引，請先重新掃描。')
+        if doc[2] in core.AI_REVIEW_STATES: raise ValueError('AI 紀錄請在原知識卡中審核或編輯，不能轉成一般知識卡。')
+        source={'path':str(path),'mtime_ns':doc[3],'size':doc[4]}
+        state=ai_service.source_state(source)
+        if state: raise ValueError(state+'；請先確認來源並重新掃描。')
+        chunks=db.execute('SELECT locator,text FROM chunks WHERE document_id=? ORDER BY id',(doc[0],))
+        derived=db.execute('SELECT locator,text,kind FROM pdf_derived WHERE document_id=? AND source_sha256=? ORDER BY page,id',(doc[0],doc[5]))
+        pieces=[]; length=0; clipped=False
+        for kind,rows in (('來源索引文字',chunks),('已校對的 PDF 衍生文字',derived)):
+            for row in rows:
+                locator,text=row[:2]; suffix='（'+row[2]+'）' if len(row)>2 else ''
+                item=f'\n\n## {kind}{suffix} · {locator}\n{text}'
+                remaining=limit-length
+                if len(item)>remaining:
+                    if remaining>0: pieces.append(item[:remaining])
+                    clipped=True; break
+                pieces.append(item); length+=len(item)
+            if clipped: break
+        if ai_service.source_state(source): raise ValueError('來源在讀取索引期間變更，未建立知識卡。')
+        if not pieces: raise ValueError('此文件尚無可複製的索引文字或已校對的 PDF 衍生文字。')
+        notice='\n（內容超過上限，僅複製前 100,000 字元）' if clipped else ''
+        return ('來源檔案：'+str(path)+'\n來源索引 SHA-256：'+str(doc[5] or '未提供')
+                +'\n這是由索引文字建立的獨立工作副本，不會自動隨來源更新；可能缺少圖片或格式，衍生內容可能有誤，請核對。'+notice+''.join(pieces))
+
 class DocumentWindow(tk.Toplevel):
     def __init__(self,master,db_path):
         super().__init__(master); self.title('文件管理 · 私人知識助理'); self.geometry('1120x760'); self.minsize(900,620); self.configure(bg=BG)
-        self.db_path=Path(db_path); self.cards=self.db_path.parent/'cards'; self.rows=[]; self.active=None; self.events=queue.Queue(); self.importing=False; self.cancel=threading.Event()
+        self.db_path=Path(db_path); self.cards=self.db_path.parent/'cards'; self.rows=[]; self.active=None; self.events=queue.Queue(); self.importing=False; self.cancel=threading.Event(); self.refresh_after=None
         self.filter=tk.StringVar(); self.kind=tk.StringVar(value='全部文件'); self.info=tk.StringVar(value='選擇文件以查看狀態。'); self.summary=tk.StringVar()
         head=tk.Frame(self,bg=BG); head.pack(fill='x',padx=24,pady=(20,8))
         label(head,'文件管理',bg=BG,font=(FONT,19,'bold')).pack(side='left')
@@ -37,7 +66,7 @@ class DocumentWindow(tk.Toplevel):
         tk.Entry(bar,textvariable=self.filter,font=(FONT,11),bd=0,highlightthickness=1,highlightbackground='#dbe4ef').pack(side='left',fill='x',expand=True,padx=(12,8),pady=12,ipady=6)
         box=ttk.Combobox(bar,textvariable=self.kind,values=('全部文件','原始文件','匯入副本','我的知識卡','待審核 AI','需要處理','完全重複'),state='readonly',width=14); box.pack(side='left',padx=4); box.bind('<<ComboboxSelected>>',lambda e:self.refresh())
         button(bar,'搜尋文件',self.refresh,True).pack(side='left',padx=10)
-        self.filter.trace_add('write',lambda *args:self.refresh())
+        self.filter.trace_add('write',lambda *args:self.schedule_refresh())
         body=tk.PanedWindow(self,orient='horizontal',bg=BG,bd=0,sashwidth=8); body.pack(fill='both',expand=True,padx=24,pady=(0,12))
         left=tk.Frame(body,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1); right=tk.Frame(body,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1)
         body.add(left,minsize=420,stretch='always'); body.add(right,minsize=300,stretch='always')
@@ -63,7 +92,7 @@ class DocumentWindow(tk.Toplevel):
         label(right,'可按上方「匯入文件副本」，或把檔案放入既有來源資料夾後，在主畫面按「重新掃描來源」。APP 不會搬動或修改原檔。',fg=MUTED,justify='left',wraplength=370).pack(anchor='w',padx=18)
         label(right,'知識卡和原始文件分開保存；目前不會自動刪除、移動或重新命名原始文件。',fg=MUTED,justify='left',wraplength=370).pack(anchor='w',padx=18,pady=(12,0))
         self.refresh()
-        self.after(150,self.poll); self.protocol('WM_DELETE_WINDOW',self.close)
+        self.poll_id=self.after(150,self.poll); self.protocol('WM_DELETE_WINDOW',self.close)
 
     def import_files(self):
         if self.importing: return
@@ -102,13 +131,24 @@ class DocumentWindow(tk.Toplevel):
                         except Exception as e: messagebox.showerror('無法切換知識庫',str(e),parent=self)
                 elif kind=='error': self.summary.set('操作未完成。'); messagebox.showerror('備份或還原未完成',value,parent=self)
         except queue.Empty: pass
-        if self.winfo_exists(): self.after(150,self.poll)
+        if self.winfo_exists(): self.poll_id=self.after(150,self.poll)
 
     def close(self):
         if self.importing: messagebox.showinfo('處理中','請等候目前的匯入或備份完成，或先按取消。',parent=self); return
         if any(getattr(child,'busy',False) for child in self.winfo_children()):
             messagebox.showinfo('處理中','請等待 PDF 頁面處理完成。',parent=self); return
         self.destroy()
+    def destroy(self):
+        for ident in (getattr(self,'poll_id',None),getattr(self,'refresh_after',None)):
+            if ident:
+                try: self.after_cancel(ident)
+                except tk.TclError: pass
+        super().destroy()
+    def schedule_refresh(self):
+        if self.refresh_after:
+            try: self.after_cancel(self.refresh_after)
+            except tk.TclError: pass
+        self.refresh_after=self.after(250,self.refresh)
     def backup_dialog(self):
         if self.importing: return
         w=tk.Toplevel(self); w.title('備份與還原'); w.geometry('620x330'); w.configure(bg=WHITE); w.transient(self)
@@ -156,6 +196,11 @@ class DocumentWindow(tk.Toplevel):
 
     def is_card(self,path): return core.contained(path,self.cards) and Path(path).parent.resolve()==self.cards.resolve()
     def refresh(self):
+        if self.refresh_after:
+            try: self.after_cancel(self.refresh_after)
+            except tk.TclError: pass
+            self.refresh_after=None
+        selected_path=self.active[0] if self.active else None; selected_id=None
         query=self.filter.get().strip().casefold(); kind=self.kind.get()
         try:
             with closing(core.connect(str(self.db_path))) as db:
@@ -179,6 +224,8 @@ class DocumentWindow(tk.Toplevel):
                 if status=='indexed' and '擷取失敗' in detail: state='部分擷取'
                 if status=='indexed' and detail in core.AI_REVIEW_STATES: state='AI 待審核' if pending else 'AI 已人工核對'
                 idx=len(self.rows); self.rows.append((path,status,detail,has_text,card,title,imported)); self.tree.insert('','end',iid=str(idx),values=(title,'知識卡' if card else '副本' if imported else Path(path).suffix.lower().lstrip('.').upper(),state))
+                if path==selected_path: selected_id=str(idx)
+            if selected_id is not None: self.tree.selection_set(selected_id); self.tree.focus(selected_id); self.select()
             self.summary.set(f'顯示 {len(self.rows)} 個文件；重複判斷只顯示已計算 SHA-256 且位元組相同者。')
         except sqlite3.Error as e: self.summary.set('讀取失敗：'+str(e))
     def select(self,event=None):
@@ -235,18 +282,8 @@ class DocumentWindow(tk.Toplevel):
         view.configure(state='disabled')
     def copy_selected(self):
         if not self.active: messagebox.showinfo('請先選擇文件','請先選擇已索引的文件。',parent=self); return
-        source=self.active[0]
-        with closing(core.connect(str(self.db_path))) as db:
-            parts=db.execute('SELECT c.locator,c.text FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.path=? ORDER BY c.id',(source,)).fetchall()
-        if not parts: messagebox.showinfo('沒有可複製的文字','此文件尚無可搜尋的文字。',parent=self); return
-        pieces=[]; length=0; clipped=False
-        for locator,text in parts:
-            item=f'\n\n## {locator}\n{text}'
-            if length+len(item)>100000:
-                pieces.append(item[:max(0,100000-length)]); clipped=True; break
-            pieces.append(item); length+=len(item)
-        notice='\n（內容超過上限，僅複製前 100,000 字元）' if clipped else ''
-        body=f'來源檔案：{source}\n這是由索引文字建立的工作副本，可能缺少圖片或格式。{notice}'+''.join(pieces)
+        try: body=indexed_card_copy(self.db_path,self.active[0])
+        except (OSError,ValueError,sqlite3.Error) as e: messagebox.showinfo('無法建立知識卡',str(e),parent=self); return
         self.editor(initial_title=self.active[5]+' — 工作副本',initial_content=body)
     def version_history(self):
         if not self.active: messagebox.showinfo('請先選擇文件','請選擇要查看版本的文件。',parent=self); return

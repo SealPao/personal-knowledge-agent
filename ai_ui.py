@@ -35,6 +35,12 @@ def lab(p,text='',**kw):
 def btn(p,text,command,primary=False):
     return tk.Button(p,text=text,command=command,bd=0,padx=14,pady=7,cursor='hand2',font=(FONT,10,'bold'),bg=BLUE if primary else '#e9f0fb',fg=WHITE if primary else '#1d4ed8')
 
+def selected_sources(sources,flags):
+    if len(sources)!=len(flags) or any(type(flag) is not bool for flag in flags): raise ValueError('來源選擇狀態無效')
+    chosen=[source for source,flag in zip(sources,flags) if flag]
+    if not chosen: raise ValueError('請至少勾選一個來源，或取消並重新搜尋。')
+    return chosen
+
 class AIWindow(tk.Toplevel):
     def __init__(self,master,db_path):
         super().__init__(master); self.title('AI 問答 · 私人知識助理'); self.geometry('1080x760'); self.minsize(850,620); self.configure(bg=BG)
@@ -219,14 +225,26 @@ class AIWindow(tk.Toplevel):
         destination='OpenAI（可能產生費用）' if self.config['provider']=='openai' else '此電腦上的本地模型服務'
         lab(w,'確認使用的資料',font=(FONT,15,'bold')).pack(anchor='w',padx=20,pady=(18,5))
         lab(w,'以下問題與片段將傳送至：'+destination,fg=MUTED).pack(anchor='w',padx=20)
-        lab(w,'會傳送下列檔案名稱與片段，不會額外傳送完整路徑；內容可能有敏感資訊，請先檢查。',fg=MUTED,font=(FONT,9)).pack(anchor='w',padx=20,pady=(2,8))
+        lab(w,'勾選的檔名與片段會傳送給 AI；取消勾選的來源不會傳送。完整路徑不額外傳送，請先檢查內容。',fg=MUTED,font=(FONT,9),wraplength=800,justify='left').pack(anchor='w',padx=20,pady=(2,8))
+        choices=tk.Frame(w,bg=WHITE); choices.pack(fill='x',padx=20,pady=(0,4))
+        selected=[]
+        for source in sources:
+            enabled=tk.BooleanVar(value=True); selected.append(enabled)
+            tk.Checkbutton(choices,text=f'[{source["id"]}] {Path(source["path"]).name} · {source.get("kind","未確認")}',variable=enabled,bg=WHITE,fg=INK,font=(FONT,9),anchor='w').pack(fill='x')
         buttons=tk.Frame(w,bg=WHITE); buttons.pack(side='bottom',fill='x',padx=20,pady=15)
         def cancel(): w.destroy(); self._set_busy(False); self.status.set('已取消傳送。')
         approved=dict(self.config)
-        btn(buttons,'取消',cancel).pack(side='right'); btn(buttons,'傳送並產生回答',lambda:self.send(w,q,sources,approved),True).pack(side='right',padx=8)
-        text=tk.Text(w,wrap='word',font=(FONT,10),fg=INK,bg='#f8fafc',bd=0,padx=12,pady=12); text.pack(fill='both',expand=True,padx=20,pady=8)
+        def submit():
+            try: chosen=selected_sources(sources,[enabled.get() for enabled in selected])
+            except ValueError as e: messagebox.showinfo('請選擇來源',str(e),parent=w); return
+            self.send(w,q,chosen,approved)
+        btn(buttons,'取消',cancel).pack(side='right'); btn(buttons,'傳送並產生回答',submit,True).pack(side='right',padx=8)
+        preview_area=tk.Frame(w,bg=WHITE); preview_area.pack(fill='both',expand=True,padx=20,pady=8)
+        text=tk.Text(preview_area,wrap='word',font=(FONT,10),fg=INK,bg='#f8fafc',bd=0,padx=12,pady=12)
+        scroll=ttk.Scrollbar(preview_area,command=text.yview); text.configure(yscrollcommand=scroll.set)
+        text.pack(side='left',fill='both',expand=True); scroll.pack(side='right',fill='y')
         text.insert('end','問題：'+q+'\n\n')
-        for s in sources: text.insert('end',f'[{s["id"]}] {Path(s["path"]).name} · {s["locator"]}\n{s["excerpt"]}\n\n')
+        for s in sources: text.insert('end',f'[{s["id"]}] {Path(s["path"]).name} · {s["locator"]}\n來源類型：{s.get("kind","未確認")}\n{s["excerpt"]}\n\n')
         text.configure(state='disabled'); w.protocol('WM_DELETE_WINDOW',cancel)
 
     def send(self,w,q,sources,approved=None):
@@ -262,7 +280,8 @@ class AIWindow(tk.Toplevel):
                     self.cites.delete(*self.cites.get_children()); self._source_text('')
                     for i,s in enumerate(sources): self.cites.insert('','end',iid=str(i),values=(f'[{s["id"]}]',Path(s['path']).name,s['locator']))
                     if sources: self.cites.selection_set('0'); self.source_select()
-                    self.status.set('回答已產生。請核對來源；AI 回答可能有錯誤。')
+                    stale=any(svc.source_state(source) for source in sources)
+                    self.status.set('來源在回答期間變更或無法存取；請重新掃描並提問。' if stale else '回答已產生。請核對來源類型與片段；AI 回答可能有錯誤。')
                 elif kind=='connection_test':
                     ok,description=value
                     if ok: messagebox.showinfo('連線測試',description,parent=self)
@@ -301,7 +320,7 @@ class AIWindow(tk.Toplevel):
         if not selected: return
         s=self.sources_by_row[int(selected[0])]
         state=svc.source_state(s)
-        self._source_text((state+'。\n' if state else '')+s['path']+'\n'+s['locator']+'\n\n'+s['excerpt'])
+        self._source_text((state+'。\n' if state else '')+'來源類型：'+s.get('kind','未確認')+'\n'+s['path']+'\n'+s['locator']+'\n\n'+s['excerpt'])
     def open_source(self):
         selected=self.cites.selection()
         if not selected: return
