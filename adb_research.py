@@ -1,5 +1,4 @@
 """Explicit, citation-bearing web research. Never executes suggested commands."""
-import decimal
 import urllib.parse
 import ai_service
 import budget
@@ -21,18 +20,18 @@ def research(db_path,brand,model,firmware,question,config,key,post=ai_service._p
     if not brand.strip() or len(brand)>100 or '\n' in brand or '\r' in brand: raise ValueError('請輸入 100 字以內的品牌名稱')
     if any(len(x)>200 or '\n' in x or '\r' in x for x in (model,firmware,question)) or not question.strip(): raise ValueError('研究內容不可為空或超過 200 字')
     if config.get('provider')!='openai' or config.get('network_enabled') is not True or not key: raise ValueError('研究模式需要啟用 OpenAI 外網及 API Key')
-    cfg=budget.get_settings(db_path)
-    if decimal.Decimal(str(cfg.get('daily','0')))>0 or decimal.Decimal(str(cfg.get('monthly','0')))>0:
-        raise ValueError('目前 APP 的預算機制未計入網路搜尋工具費；設定預算時暫不允許研究模式')
     query=f'品牌：{brand}；型號：{model or "未提供"}；韌體：{firmware or "未提供"}；研究問題：{question}'
     maximum=min(1600,int(config.get('max_tokens',800)))
-    payload={'model':config['openai_model'],'instructions':INSTRUCTIONS,'input':query,'tools':[{'type':'web_search'}],'max_output_tokens':maximum,'store':False}
-    ticket=budget.reserve(db_path,query,[],config['openai_model'],maximum,extra_input_tokens=8192)
+    payload={'model':config['openai_model'],'instructions':INSTRUCTIONS,'input':query,'tools':[{'type':'web_search','search_context_size':'low'}],'tool_choice':'required','max_tool_calls':1,'max_output_tokens':maximum,'store':False}
+    ticket=budget.reserve(db_path,query,[],config['openai_model'],maximum,extra_input_tokens=131072,tool_kind='web_search',tool_calls=1)
     try:
         response=post('https://api.openai.com/v1/responses',{'Authorization':'Bearer '+key,'Content-Type':'application/json'},payload)
-    finally:
-        # Hosted search tool fees are not included in the token-based estimate.
+    except Exception:
         budget.uncertain(db_path,ticket)
+        raise
+    tool_results=[x for x in response.get('output',[]) if x.get('type')=='web_search_call']
+    # If the response lacks the expected tool item, leave cost uncertain.
+    cost_status=budget.finish(db_path,ticket,response.get('usage',{}),tool_calls=len(tool_results) if tool_results else None)
     if response.get('status')=='incomplete': raise ValueError('研究回答未完成')
     pieces=[]; sources=[]
     for item in response.get('output',[]):
@@ -52,7 +51,7 @@ def research(db_path,brand,model,firmware,question,config,key,post=ai_service._p
             pieces.append(text)
     text='\n'.join(pieces).strip()
     if not text: raise ValueError('研究服務沒有回傳內容')
-    return {'query':query,'text':text,'sources':sources,'usage':response.get('usage',{})}
+    return {'query':query,'text':text,'sources':sources,'usage':response.get('usage',{}),'cost_status':cost_status}
 
 def save(db_path,result):
     links='\n'.join(f'[{i}] {source["title"]} — {source["url"]}' for i,source in enumerate(result['sources'],1)) or '沒有可驗證的網路引用。'

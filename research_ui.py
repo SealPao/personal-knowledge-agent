@@ -77,7 +77,9 @@ class ResearchWindow(tk.Toplevel):
                         self.text.insert('end',f'[{i}] {source["title"]}\n{source["url"]}\n\n',tag)
                         self.text.tag_configure(tag,foreground='#1d4ed8',underline=True); self.text.tag_bind(tag,'<Button-1>',lambda e,url=source['url']:os.startfile(url))
                     if not result['sources']: self.text.insert('end','沒有可驗證的來源；所有內容均為未驗證。')
-                    self.text.configure(state='disabled'); self.status.set('已保存待驗證筆記；搜尋工具費用未計入 APP 估算，請核對官方用量。')
+                    self.text.configure(state='disabled')
+                    cost={'complete':'費用已依自行設定單價估算','unpriced':'單價未設定，費用未定價','unknown':'用量或搜尋次數未確認'}.get(result.get('cost_status'),'費用狀態未確認')
+                    self.status.set('已保存待驗證筆記；'+cost+'，請核對官方用量。')
                     if hasattr(self.master,'refresh_metrics'): self.master.refresh_metrics()
         except queue.Empty: pass
         if self.winfo_exists(): self.after(150,self.poll)

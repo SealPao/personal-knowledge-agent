@@ -17,6 +17,7 @@ class BudgetWindow(tk.Toplevel):
         cfg=budget.get_settings(self.db); price=cfg.get('prices',{}).get(model,{})
         self.day=tk.StringVar(value=str(cfg.get('daily','0'))); self.month=tk.StringVar(value=str(cfg.get('monthly','0')))
         self.inprice=tk.StringVar(value=str(price.get('input','0'))); self.outprice=tk.StringVar(value=str(price.get('output','0')))
+        self.webprice=tk.StringVar(value=str(cfg.get('web_search_price','0')))
         head=tk.Frame(self,bg=WHITE); head.pack(fill='x',padx=20,pady=(15,5))
         lab(head,'APP 預算與用量',font=(FONT,16,'bold')).pack(side='left')
         lab(self,'僅統計這個 APP 的 OpenAI 請求；不是官方帳戶用量、帳單或餘額。',fg=MUTED).pack(anchor='w',padx=20)
@@ -29,6 +30,8 @@ class BudgetWindow(tk.Toplevel):
         lab(self,'目前設定模型：'+model,font=(FONT,10,'bold')).pack(anchor='w',padx=20,pady=(8,2))
         prices=tk.Frame(self,bg=WHITE); prices.pack(fill='x',padx=20)
         field(prices,'每 100 萬輸入 Token 的 USD',self.inprice); field(prices,'每 100 萬輸出 Token 的 USD',self.outprice)
+        webrow=tk.Frame(self,bg=WHITE); webrow.pack(fill='x',padx=20)
+        field(webrow,'每次網路搜尋的 USD（依官方價格自行填寫）',self.webprice)
         controls=tk.Frame(self,bg=WHITE); controls.pack(fill='x',padx=20,pady=(5,10))
         btn(controls,'儲存預算與價格',self.save,True).pack(side='left')
         btn(controls,'排除選取的未確認紀錄',self.exclude).pack(side='left',padx=10)
@@ -41,7 +44,7 @@ class BudgetWindow(tk.Toplevel):
         bar=ttk.Scrollbar(frame,command=self.tree.yview); self.tree.configure(yscrollcommand=bar.set); self.tree.pack(side='left',fill='both',expand=True); bar.pack(side='right',fill='y')
         self.refresh()
     def save(self):
-        try: budget.save_settings(self.db,self.day.get(),self.month.get(),self.model,self.inprice.get(),self.outprice.get()); self.refresh(); messagebox.showinfo('已儲存','預算與目前模型單價已儲存。',parent=self)
+        try: budget.save_settings(self.db,self.day.get(),self.month.get(),self.model,self.inprice.get(),self.outprice.get(),self.webprice.get()); self.refresh(); messagebox.showinfo('已儲存','預算、模型單價與網路搜尋單價已儲存。',parent=self)
         except Exception as e: messagebox.showerror('無法儲存',str(e),parent=self)
     def refresh(self):
         self.rows=budget.recent(self.db); self.tree.delete(*self.tree.get_children())

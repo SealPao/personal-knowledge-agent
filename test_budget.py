@@ -46,5 +46,13 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaises(ValueError): budget.reserve(self.path,'目標',self.sources,'model',100,now=self.now,extra_input_tokens=8192)
         self.assertFalse(budget.recent(self.path))
         with self.assertRaises(ValueError): budget.reserve(self.path,'目標',self.sources,'model',100,now=self.now,extra_input_tokens=-1)
+    def test_tool_pricing_is_preserved_and_missing_count_stays_uncertain(self):
+        budget.save_settings(self.path,'1','2','model','1','2','0.01')
+        budget.save_settings(self.path,'1','2','model','1','2')
+        self.assertEqual(budget.get_settings(self.path)['web_search_price'],'0.01')
+        ticket=budget.reserve(self.path,'目標',self.sources,'model',100,now=self.now,extra_input_tokens=131072,tool_kind='web_search',tool_calls=1)
+        budget.finish(self.path,ticket,{'input_tokens':100,'output_tokens':10})
+        self.assertEqual(budget.recent(self.path)[0][2],'unknown')
+        self.assertGreater(budget.recent(self.path)[0][5],10000000)
 
 if __name__=='__main__': unittest.main()
