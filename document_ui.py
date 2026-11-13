@@ -10,6 +10,7 @@ from contextlib import closing
 from pathlib import Path
 import core
 import ai_service
+import import_history
 import package_service
 import workspace
 
@@ -57,40 +58,41 @@ def _import_one(db_path,path,retry_target=''):
                 FROM documents d WHERE d.path=?''',(str(target),)).fetchone()
         if not row: raise ValueError('副本已寫入，但索引紀錄無法確認')
         status,detail,has_text=row
-        if not created: state='已有副本'
-        elif status!='indexed': state='副本已保存，解析失敗'
+        if status!='indexed': state='副本已保存，解析失敗'
         elif not has_text: state='副本已保存，沒有可搜尋文字'
+        elif not created: state='已有副本'
         else: state='匯入成功'
         return {'source':str(path),'state':state,'detail':detail,'target':str(target)}
     except Exception as e:
         return {'source':str(path),'state':'未完成','detail':str(e),'target':str(target)}
 
-def import_batch(db_path,paths,cancelled=lambda:False,progress=lambda _:None):
+def import_batch(db_path,paths,cancelled=lambda:False,progress=lambda _:None,on_item=lambda index,item:None):
     """Return a per-file outcome, including copied files whose parsing failed."""
     results=[]; paths=list(paths); total=len(paths)
     for index,path in enumerate(paths):
         if cancelled():
             results.extend({'source':str(p),'state':'未處理','detail':'使用者已取消','target':''} for p in paths[index:]); break
         if index==0 or index%10==0: progress(f'正在匯入 {index+1} / {total}：{Path(path).name}')
-        results.append(_import_one(db_path,path))
+        item=_import_one(db_path,path); on_item(index,item); results.append(item)
     return results
 
-def retry_import_batch(db_path,previous,cancelled=lambda:False,progress=lambda _:None):
+def retry_import_batch(db_path,previous,cancelled=lambda:False,progress=lambda _:None,on_item=lambda index,item:None):
     """Retry failed or cancelled items while keeping successful outcomes."""
     results=[dict(item) for item in previous]
     targets=[i for i,item in enumerate(results) if item['state'] in ('副本已保存，解析失敗','未完成','未處理')]
     for number,index in enumerate(targets,1):
         if cancelled(): break
         item=results[index]; progress(f'正在重試 {number} / {len(targets)}：{Path(item["source"]).name}')
+        if item.get('target_missing'): continue
         # A saved copy is re-parsed in place; no new copy is created.
         retry_target=item['target'] if item['target'] else ''
-        results[index]=_import_one(db_path,item['source'],retry_target)
+        results[index]=_import_one(db_path,item['source'],retry_target); on_item(index,results[index])
     return results
 
 class DocumentWindow(tk.Toplevel):
     def __init__(self,master,db_path):
         super().__init__(master); self.title('文件管理 · 私人知識助理'); self.geometry('1120x760'); self.minsize(900,620); self.configure(bg=BG)
-        self.db_path=Path(db_path); self.cards=self.db_path.parent/'cards'; self.rows=[]; self.active=None; self.events=queue.Queue(); self.importing=False; self.cancel=threading.Event(); self.refresh_after=None; self.import_results=[]
+        self.db_path=Path(db_path); self.cards=self.db_path.parent/'cards'; self.rows=[]; self.active=None; self.events=queue.Queue(); self.importing=False; self.cancel=threading.Event(); self.refresh_after=None; self.import_results=[]; self.import_batch_id=None
         self.filter=tk.StringVar(); self.kind=tk.StringVar(value='全部文件'); self.info=tk.StringVar(value='選擇文件以查看狀態。'); self.summary=tk.StringVar()
         head=tk.Frame(self,bg=BG); head.pack(fill='x',padx=24,pady=(20,8))
         label(head,'文件管理',bg=BG,font=(FONT,19,'bold')).pack(side='left')
@@ -147,7 +149,13 @@ class DocumentWindow(tk.Toplevel):
         if not paths: return
         self.importing=True; self.cancel.clear(); self.summary.set(f'正在匯入 {len(paths)} 個文件副本…')
         def work():
-            try: self.events.put(('import',import_batch(self.db_path,paths,self.cancel.is_set,lambda text:self.events.put(('progress',text)))))
+            try:
+                with import_history.ImportHistory(self.db_path) as history:
+                    batch=history.create(paths); self.events.put(('import_started',batch))
+                    with import_history.batch_lock(self.db_path,batch):
+                        import_batch(self.db_path,paths,self.cancel.is_set,lambda text:self.events.put(('progress',text)),lambda i,item:history.update(batch,i,item))
+                        if self.cancel.is_set(): history.cancel_pending(batch)
+                    self.events.put(('import',(batch,history.load(batch))))
             except Exception as e: self.events.put(('error',str(e)))
         threading.Thread(target=work,daemon=True).start()
     def poll(self):
@@ -155,9 +163,10 @@ class DocumentWindow(tk.Toplevel):
             while True:
                 kind,value=self.events.get_nowait()
                 if kind=='progress': self.summary.set(value); continue
+                if kind=='import_started': self.import_batch_id=value; continue
                 self.importing=False
                 if kind=='import':
-                    self.import_results=value; self.refresh(); self.master.refresh_metrics()
+                    self.import_batch_id,self.import_results=value; value=self.import_results; self.refresh(); self.master.refresh_metrics()
                     count=lambda state:sum(item['state']==state for item in value)
                     attention=sum(item['state'] not in ('匯入成功','已有副本') for item in value)
                     self.summary.set(f'匯入結果：成功 {count("匯入成功")}、已有副本 {count("已有副本")}、需處理或未處理 {attention}。')
@@ -176,30 +185,67 @@ class DocumentWindow(tk.Toplevel):
         if self.winfo_exists(): self.poll_id=self.after(150,self.poll)
 
     def show_import_results(self):
-        if not self.import_results: messagebox.showinfo('尚無匯入結果','此視窗尚未執行匯入。',parent=self); return
-        w=tk.Toplevel(self); w.title('最近匯入結果'); w.geometry('820x580'); w.configure(bg=WHITE)
-        label(w,'最近匯入結果',font=(FONT,15,'bold')).pack(anchor='w',padx=18,pady=(16,4))
-        label(w,'解析失敗的副本仍保存在 APP；沒有可搜尋文字的文件可能需要 OCR。重試只處理失敗或未處理項目。',fg=MUTED,wraplength=760,justify='left').pack(anchor='w',padx=18)
+        if self.importing: messagebox.showinfo('處理中','請等待目前作業完成後查看匯入紀錄。',parent=self); return
+        try:
+            with import_history.ImportHistory(self.db_path) as history: batches=history.batches()
+        except (OSError,sqlite3.Error) as e: messagebox.showerror('無法讀取匯入紀錄',str(e),parent=self); return
+        if not batches: messagebox.showinfo('尚無匯入紀錄','這個知識庫尚未記錄匯入批次。',parent=self); return
+        w=tk.Toplevel(self); w.title('匯入紀錄與重試'); w.geometry('820x620'); w.configure(bg=WHITE)
+        label(w,'匯入紀錄與重試',font=(FONT,15,'bold')).pack(anchor='w',padx=18,pady=(16,4))
+        label(w,'重試會重新解析已保存的副本；尚未建立副本的項目會重新讀取原來源目前內容，不會修改它。搬移後請確認舊路徑；無文字文件可能需要 OCR。',fg=MUTED,wraplength=760,justify='left').pack(anchor='w',padx=18)
+        label(w,'匯入紀錄與來源路徑保存在知識庫中，並隨 .pka 備份。',fg=MUTED,font=(FONT,9)).pack(anchor='w',padx=18,pady=(3,0))
+        choices=[f'{created} · {count} 個檔案 · {ident[:8]}' for ident,created,updated,count in batches]
+        selector=ttk.Combobox(w,values=choices,state='readonly'); selector.pack(fill='x',padx=18,pady=(8,0))
+        initial=next((i for i,row in enumerate(batches) if row[0]==self.import_batch_id),0); selector.current(initial)
+        current={'id':None,'items':[]}
         actions=tk.Frame(w,bg=WHITE); actions.pack(side='bottom',fill='x',padx=18,pady=(0,14))
         def retry():
             if self.importing: messagebox.showinfo('處理中','請等待目前作業完成。',parent=w); return
-            if not any(item['state'] in ('副本已保存，解析失敗','未完成','未處理') for item in self.import_results):
-                messagebox.showinfo('沒有待重試項目','沒有解析失敗或未處理的項目；無文字文件可使用 OCR。',parent=w); return
-            previous=[dict(item) for item in self.import_results]; self.importing=True; self.cancel.clear(); self.summary.set('正在重試未完成項目…'); w.destroy()
+            if not any(item['state'] in import_history.RETRY_STATES and not item.get('target_missing') for item in current['items']):
+                messagebox.showinfo('沒有可重試項目','沒有可重試項目；若副本無法存取，請檢查知識庫或重新選擇來源。無文字文件可使用 OCR。',parent=w); return
+            batch=current['id']; self.importing=True; self.cancel.clear(); self.summary.set('正在重試未完成項目…'); w.destroy()
             def work():
-                try: self.events.put(('import',retry_import_batch(self.db_path,previous,self.cancel.is_set,lambda text:self.events.put(('progress',text)))))
+                try:
+                    with import_history.batch_lock(self.db_path,batch),import_history.ImportHistory(self.db_path) as history:
+                        previous=history.load(batch)
+                        retry_import_batch(self.db_path,previous,self.cancel.is_set,lambda text:self.events.put(('progress',text)),lambda i,item:history.update(batch,i,item))
+                        if self.cancel.is_set(): history.cancel_pending(batch)
+                        self.events.put(('import',(batch,history.load(batch))))
                 except Exception as e: self.events.put(('error',str(e)))
             threading.Thread(target=work,daemon=True).start()
+        def show_attempts():
+            try:
+                with import_history.ImportHistory(self.db_path) as history: events=history.events(current['id'])
+            except (OSError,sqlite3.Error) as e: messagebox.showerror('無法讀取嘗試歷程',str(e),parent=w); return
+            view=tk.Toplevel(w); view.title('匯入嘗試歷程'); view.geometry('780x500'); view.configure(bg=WHITE)
+            label(view,'匯入嘗試歷程',font=(FONT,14,'bold')).pack(anchor='w',padx=18,pady=(16,4))
+            area=tk.Frame(view,bg=WHITE); area.pack(fill='both',expand=True,padx=18,pady=10)
+            box=tk.Text(area,wrap='word',font=(FONT,10),bg='#f8fafc',bd=0,padx=10,pady=10)
+            scroll=ttk.Scrollbar(area,command=box.yview); box.configure(yscrollcommand=scroll.set); box.pack(side='left',fill='both',expand=True); scroll.pack(side='right',fill='y')
+            for when,source,state,detail in events: box.insert('end',f'{when} · {state}\n{source}\n{detail}\n\n')
+            if not events: box.insert('end','尚無已完成的處理嘗試。')
+            box.configure(state='disabled')
+        button(actions,'查看嘗試歷程',show_attempts).pack(side='left')
         button(actions,'重試未完成項目',retry,True).pack(side='right')
         area=tk.Frame(w,bg=WHITE); area.pack(fill='both',expand=True,padx=18,pady=12)
         text=tk.Text(area,wrap='word',font=(FONT,10),fg=INK,bg='#f8fafc',bd=0,padx=10,pady=10)
         scroll=ttk.Scrollbar(area,command=text.yview); text.configure(yscrollcommand=scroll.set); text.pack(side='left',fill='both',expand=True); scroll.pack(side='right',fill='y')
-        for item in self.import_results:
-            text.insert('end',f"{item['state']} · {Path(item['source']).name}\n來源：{item['source']}\n")
-            if item['target']: text.insert('end','副本或既有項目：'+item['target']+'\n')
-            if item['detail']: text.insert('end',item['detail']+'\n')
-            text.insert('end','\n')
-        text.configure(state='disabled')
+        def display(event=None):
+            index=selector.current()
+            if index<0: return
+            batch=batches[index][0]
+            try:
+                with import_history.ImportHistory(self.db_path) as history: items=history.load(batch)
+            except (OSError,sqlite3.Error) as e: messagebox.showerror('無法讀取匯入紀錄',str(e),parent=w); return
+            current['id']=batch; current['items']=items; self.import_batch_id=batch; self.import_results=items
+            text.configure(state='normal'); text.delete('1.0','end')
+            for item in items:
+                text.insert('end',f"{item['state']} · {Path(item['source']).name}\n來源：{item['source']}\n")
+                if item['target']: text.insert('end','副本或既有項目：'+item['target']+'\n')
+                if item['detail']: text.insert('end',item['detail']+'\n')
+                text.insert('end','\n')
+            text.configure(state='disabled')
+        selector.bind('<<ComboboxSelected>>',display); display()
 
     def close(self):
         if self.importing: messagebox.showinfo('處理中','請等候目前的匯入或備份完成，或先按取消。',parent=self); return
@@ -222,7 +268,7 @@ class DocumentWindow(tk.Toplevel):
         w=tk.Toplevel(self); w.title('備份與還原'); w.geometry('620x330'); w.configure(bg=WHITE); w.transient(self)
         label(w,'備份與還原',font=(FONT,16,'bold')).pack(anchor='w',padx=22,pady=(20,8))
         label(w,'備份為單一 .pka，包含來源文件、知識卡、匯入副本與搜尋資料。若來源未同步或和索引不一致，會停止並提示。',fg=MUTED,justify='left',wraplength=560).pack(anchor='w',padx=22)
-        label(w,'匯入會在 APP 資料夾建立獨立知識庫，隨 APP 一起搬移；不會覆蓋原始文件。API Key 不會匯出；文件本身若含機密仍會被封裝。',fg=MUTED,justify='left',wraplength=560).pack(anchor='w',padx=22,pady=12)
+        label(w,'匯入會建立獨立知識庫，不會覆蓋原始文件。備份包含匯入紀錄與原始來源路徑；API Key 不會匯出，文件與路徑仍可能含私人資訊。',fg=MUTED,justify='left',wraplength=560).pack(anchor='w',padx=22,pady=12)
         bar=tk.Frame(w,bg=WHITE); bar.pack(side='bottom',fill='x',padx=22,pady=20)
         def export():
             name=filedialog.asksaveasfilename(parent=w,title='儲存知識庫備份',defaultextension='.pka',filetypes=[('PKA 知識庫','*.pka')])

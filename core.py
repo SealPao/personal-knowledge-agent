@@ -368,7 +368,7 @@ def retry_import_copy(db_path,target,source_label):
         folder_st=os.stat(folder,follow_symlinks=False)
         if stat.S_ISLNK(folder_st.st_mode) or getattr(folder_st,'st_file_attributes',0)&REPARSE: raise ValueError('匯入資料夾不能是重新解析點')
         row=db.execute('SELECT status,sha256 FROM documents WHERE path=?',(str(target),)).fetchone()
-        if not row or row[0]!='error' or not row[1]: raise ValueError('只有解析失敗且有雜湊的匯入副本可以重試')
+        if not row or row[0] not in ('error','indexed') or not row[1]: raise ValueError('只有已記錄雜湊的匯入副本可以重試')
         before=os.stat(target,follow_symlinks=False); attrs=getattr(before,'st_file_attributes',0)
         if not stat.S_ISREG(before.st_mode) or attrs & (PLACEHOLDER|REPARSE) or before.st_size>MAX_SIZE:
             raise ValueError('匯入副本無法安全讀取')
@@ -377,6 +377,7 @@ def retry_import_copy(db_path,target,source_label):
         if (len(data)>MAX_SIZE or not stat.S_ISREG(after.st_mode) or getattr(after,'st_file_attributes',0)&(PLACEHOLDER|REPARSE)
                 or before.st_size!=after.st_size or before.st_mtime_ns!=after.st_mtime_ns or hashlib.sha256(data).hexdigest()!=row[1]):
             raise ValueError('匯入副本已變更，未重新解析；請重新選擇來源匯入')
+        if row[0]=='indexed': return str(target),False
         prefix='手動匯入副本；原始路徑：'+str(source_label)+'；'
         try:
             chunks,detail=parse(target,data)
