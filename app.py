@@ -396,6 +396,8 @@ class App(tk.Tk):
             return bool(getattr(widget,'importing',False) or getattr(widget,'busy',False)) or any(active(x) for x in widget.winfo_children())
         if any(active(child) for child in self.winfo_children()):
             messagebox.showinfo('處理中','文件匯入、備份或 AI 問答尚未完成。請等待，或在文件管理中取消作業。'); return
+        import local_ai
+        local_ai.stop()
         self.destroy()
 
 if __name__=='__main__': App().mainloop()

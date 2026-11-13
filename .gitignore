@@ -8,6 +8,10 @@ __pycache__/
 *.pka
 *.exe
 *.traineddata
+*.gguf
+*.partial
+*.download
+local-ai/
 .env
 .env.*
 *.spec

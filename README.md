@@ -27,3 +27,9 @@ PDF 預覽使用 pypdfium2；文字型表格使用 pdfplumber。Windows OCR 可�
 發行時請分別遵守並隨發行包附上 Android Platform Tools、Tesseract、其語言資料及其他依賴的第三方授權。程式碼採 MIT；不代表上述第三方元件皆為 MIT。請勿提交使用者知識庫、截圖、憑證、備份或日誌。
 
 AI 研究與裝置觀察紀錄可在文件管理中進行人工核對、撤回及查看歷史；編輯後回到待審核，網路研究即使已核對仍不代表裝置實測。
+
+## 可選內建本地模型
+
+可攜版可由使用者明確選擇下載 Google Gemma 4 26B A4B Q4 模型與圖片組件，按鈕啟動或關閉，不依賴 Ollama。下載固定版本並檢驗 SHA-256；模型不自動下載，也不包含在知識庫封裝中。模型檔及本地使用者資料不可提交至 Git。使用者可保留或選擇其他本機服務。
+
+執行程式需另行隨發行包放置於 `local-ai/runtime/`（Windows x64 llama.cpp，含相依 DLL），模型置於 `local-ai/models/`。模型與 llama.cpp 有各自的第三方授權；發行時應附授權資料。請先實測模型與硬體，32 GB 的可用記憶體和推論速度因環境而異。測試另包括 `python -m unittest -v test_local_ai`。

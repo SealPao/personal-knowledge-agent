@@ -2,11 +2,13 @@ import json
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
 import ai_service as svc
 import budget
+import local_ai
 
 FONT='Microsoft JhengHei UI'; WHITE='#ffffff'; BG='#f1f5f9'; INK='#1b2c40'; MUTED='#64748b'; BLUE='#2563eb'
 DEFAULT={'provider':'openai','openai_model':'gpt-5.4-mini','local_model':'','local_base':'http://127.0.0.1:11434/v1','max_tokens':800,'network_enabled':False}
@@ -37,14 +39,18 @@ class AIWindow(tk.Toplevel):
     def __init__(self,master,db_path):
         super().__init__(master); self.title('AI 問答 · 私人知識助理'); self.geometry('1080x760'); self.minsize(850,620); self.configure(bg=BG)
         self.db=Path(db_path); self.config_path=self.db.parent/'ai-settings.json'; self.config=read_config(self.config_path)
-        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]
+        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False
         self.question=tk.StringVar(); self.hint=tk.StringVar(); self._set_hint()
         head=tk.Frame(self,bg=BG); head.pack(fill='x',padx=25,pady=(20,12))
         lab(head,'與你的文件對話',bg=BG,font=(FONT,19,'bold')).pack(side='left')
         btn(head,'AI 設定',self.settings).pack(side='right')
+        self.local_button=btn(head,'關閉內建本地 AI' if local_ai.running() else '啟動內建本地 AI',self.toggle_local)
+        self.local_button.pack(side='right',padx=8)
         btn(head,'預算與用量',self.open_budget).pack(side='right',padx=8)
         btn(head,'用閱讀器找答案',self.open_device).pack(side='right')
         lab(self,textvariable=self.hint,bg=BG,fg=MUTED,anchor='w').pack(fill='x',padx=25)
+        self.download_button=btn(self,'下載可選本地模型（約 15.6 GB）',self.download_model)
+        self.download_button.pack(anchor='w',padx=25,pady=(5,0))
         card=tk.Frame(self,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1); card.pack(fill='x',padx=25,pady=12)
         lab(card,'你想知道什麼？',font=(FONT,11,'bold')).pack(anchor='w',padx=15,pady=(12,4))
         row=tk.Frame(card,bg=WHITE); row.pack(fill='x',padx=15,pady=(0,15))
@@ -72,9 +78,36 @@ class AIWindow(tk.Toplevel):
         self.protocol('WM_DELETE_WINDOW',self.close); self.after(150,self.poll)
 
     def _set_hint(self):
-        if self.config['provider']=='local': self.hint.set('本地 AI 模式：使用你自己啟動的本機模型服務，不使用 OpenAI。')
+        if self.config['provider']=='local': self.hint.set('本地 AI 模式：'+('內建模型運行中。' if local_ai.running() else '使用設定的本機模型服務；內建模型尚未啟動。'))
         elif not self.config['network_enabled']: self.hint.set('外網存取已關閉。OpenAI 無法連線；本地模型仍可使用。')
         else: self.hint.set('OpenAI 模式：確認後會將問題與選中的文件片段傳送至 OpenAI，可能產生 API 費用。')
+    def toggle_local(self):
+        if self.busy: return
+        if local_ai.running():
+            local_ai.stop(); self.local_button.configure(text='啟動內建本地 AI'); self._set_hint(); self.status.set('內建本地 AI 已關閉。'); return
+        self._set_busy(True); self.local_button.configure(state='disabled'); self.status.set('正在啟動本地模型，首次載入可能需要數分鐘…')
+        def start():
+            try:
+                try: result=local_ai.start()
+                except RuntimeError: result=local_ai.start(gpu=False)
+                self.events.put(('local_started',(True,result)))
+            except Exception as e: self.events.put(('local_started',(False,str(e))))
+        threading.Thread(target=start,daemon=True).start()
+    def download_model(self):
+        if self.downloading:
+            self.download_cancel.set(); self.status.set('正在取消下載…'); return
+        if self.busy or local_ai.running(): return
+        if not messagebox.askyesno('下載可選本地 AI','將從 Hugging Face 下載 Google Gemma 4 模型及圖片組件，約 15.6 GB，並驗證完整性。下載需要網路與足夠磁碟空間。確定下載嗎？',parent=self): return
+        self.downloading=True; self.download_cancel.clear(); self._set_busy(True); self.local_button.configure(state='disabled'); self.download_button.configure(text='取消模型下載'); self.status.set('正在下載本地模型…')
+        def worker():
+            last=[0.0]
+            def progress(done,total):
+                now=time.monotonic()
+                if now-last[0]>=1 or done==total:
+                    last[0]=now; self.events.put(('download_progress',(done,total)))
+            try: local_ai.download(progress,self.download_cancel.is_set); self.events.put(('download_done',(True,'下載完成並已驗證，可啟動內建本地 AI。')))
+            except Exception as e: self.events.put(('download_done',(False,str(e))))
+        threading.Thread(target=worker,daemon=True).start()
     def open_budget(self):
         import budget_ui
         budget_ui.BudgetWindow(self,self.db,self.config['openai_model'])
@@ -215,6 +248,21 @@ class AIWindow(tk.Toplevel):
                     ok,description=value
                     if ok: messagebox.showinfo('連線測試',description,parent=self)
                     else: messagebox.showerror('連線測試失敗',description,parent=self)
+                elif kind=='local_started':
+                    ok,result=value; self._set_busy(False); self.local_button.configure(state='normal')
+                    if ok:
+                        base,model=result; self.config=read_config(self.config_path); self.config.update(provider='local',local_base=base,local_model=model)
+                        try: write_config(self.config_path,self.config)
+                        except Exception as e:
+                            local_ai.stop(); self.status.set('無法保存設定：'+str(e)); continue
+                        self.local_button.configure(text='關閉內建本地 AI'); self._set_hint(); self.status.set('內建本地 AI 已啟動，可使用本地文件問答與支援圖片的閱讀器探索。')
+                    else:
+                        self.status.set('本地模型啟動失敗：'+result); messagebox.showerror('本地模型啟動失敗',result,parent=self)
+                elif kind=='download_progress':
+                    done,total=value; self.status.set(f'下載本地模型：{done/total*100:.1f}%')
+                elif kind=='download_done':
+                    ok,description=value; self.downloading=False; self._set_busy(False); self.local_button.configure(state='normal'); self.download_button.configure(text='下載可選本地模型（約 15.6 GB）'); self.status.set(description)
+                    if not ok: messagebox.showerror('模型下載未完成',description,parent=self)
         except queue.Empty: pass
         if self.winfo_exists(): self.after(150,self.poll)
     def source_select(self,event=None):
