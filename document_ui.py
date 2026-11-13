@@ -35,7 +35,7 @@ class DocumentWindow(tk.Toplevel):
         label(footer,textvariable=self.summary,bg=BG,fg=MUTED,anchor='w').pack(fill='x')
         bar=tk.Frame(self,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1); bar.pack(fill='x',padx=24,pady=12)
         tk.Entry(bar,textvariable=self.filter,font=(FONT,11),bd=0,highlightthickness=1,highlightbackground='#dbe4ef').pack(side='left',fill='x',expand=True,padx=(12,8),pady=12,ipady=6)
-        box=ttk.Combobox(bar,textvariable=self.kind,values=('全部文件','原始文件','匯入副本','我的知識卡','需要處理','完全重複'),state='readonly',width=14); box.pack(side='left',padx=4); box.bind('<<ComboboxSelected>>',lambda e:self.refresh())
+        box=ttk.Combobox(bar,textvariable=self.kind,values=('全部文件','原始文件','匯入副本','我的知識卡','待審核 AI','需要處理','完全重複'),state='readonly',width=14); box.pack(side='left',padx=4); box.bind('<<ComboboxSelected>>',lambda e:self.refresh())
         button(bar,'搜尋文件',self.refresh,True).pack(side='left',padx=10)
         self.filter.trace_add('write',lambda *args:self.refresh())
         body=tk.PanedWindow(self,orient='horizontal',bg=BG,bd=0,sashwidth=8); body.pack(fill='both',expand=True,padx=24,pady=(0,12))
@@ -56,6 +56,9 @@ class DocumentWindow(tk.Toplevel):
         button(tools,'查看文字版本',self.version_history).pack(side='left',padx=(0,6))
         button(tools,'PDF 圖片、表格與 OCR',self.pdf_tools).pack(side='left')
         button(right,'查看紀錄中的閱讀器截圖',self.device_capture).pack(anchor='w',padx=18,pady=(8,0))
+        reviewbar=tk.Frame(right,bg=WHITE); reviewbar.pack(anchor='w',padx=18,pady=(8,0))
+        button(reviewbar,'審核或撤回 AI 紀錄',self.review_card).pack(side='left')
+        button(reviewbar,'查看審核歷史',self.review_history).pack(side='left',padx=6)
         label(right,'要新增原始資料？',font=(FONT,11,'bold')).pack(anchor='w',padx=18,pady=(14,4))
         label(right,'可按上方「匯入文件副本」，或把檔案放入既有來源資料夾後，在主畫面按「重新掃描來源」。APP 不會搬動或修改原檔。',fg=MUTED,justify='left',wraplength=370).pack(anchor='w',padx=18)
         label(right,'知識卡和原始文件分開保存；目前不會自動刪除、移動或重新命名原始文件。',fg=MUTED,justify='left',wraplength=370).pack(anchor='w',padx=18,pady=(12,0))
@@ -164,8 +167,8 @@ class DocumentWindow(tk.Toplevel):
             self.tree.delete(*self.tree.get_children()); self.rows=[]; self.active=None
             self.description.configure(state='normal'); self.description.delete('1.0','end'); self.description.configure(state='disabled')
             for path,status,detail,has_text,sha in records:
-                card=self.is_card(path); imported=core.contained(path,self.db_path.parent/'imported'); needs=status!='indexed' or not has_text or '擷取失敗' in detail
-                if kind=='原始文件' and (card or imported) or kind=='匯入副本' and not imported or kind=='我的知識卡' and not card or kind=='需要處理' and not needs or kind=='完全重複' and counts.get(sha,0)<2: continue
+                card=self.is_card(path); imported=core.contained(path,self.db_path.parent/'imported'); pending=detail in core.AI_REVIEW_STATES and detail==core.AI_REVIEW_STATES[detail][0]; needs=status!='indexed' or not has_text or '擷取失敗' in detail or pending
+                if kind=='原始文件' and (card or imported) or kind=='匯入副本' and not imported or kind=='我的知識卡' and not card or kind=='待審核 AI' and not pending or kind=='需要處理' and not needs or kind=='完全重複' and counts.get(sha,0)<2: continue
                 title=Path(path).name
                 if card:
                     try:
@@ -174,6 +177,7 @@ class DocumentWindow(tk.Toplevel):
                 if query and query not in (title+' '+path).casefold(): continue
                 state={'indexed':'已索引' if has_text else '沒有文字','error':'處理失敗','unsupported':'格式未支援','skipped':'已略過','missing':'來源遺失'}.get(status,status)
                 if status=='indexed' and '擷取失敗' in detail: state='部分擷取'
+                if status=='indexed' and detail in core.AI_REVIEW_STATES: state='AI 待審核' if pending else 'AI 已人工核對'
                 idx=len(self.rows); self.rows.append((path,status,detail,has_text,card,title,imported)); self.tree.insert('','end',iid=str(idx),values=(title,'知識卡' if card else '副本' if imported else Path(path).suffix.lower().lstrip('.').upper(),state))
             self.summary.set(f'顯示 {len(self.rows)} 個文件；重複判斷只顯示已計算 SHA-256 且位元組相同者。')
         except sqlite3.Error as e: self.summary.set('讀取失敗：'+str(e))
@@ -205,6 +209,30 @@ class DocumentWindow(tk.Toplevel):
             if not data: messagebox.showinfo('沒有截圖','這份文件沒有保存閱讀器截圖。',parent=self); return
             adb_ui.show_captures(self,data)
         except Exception as e: messagebox.showerror('無法查看截圖',str(e),parent=self)
+    def review_card(self):
+        if not self.active or not self.active[4] or self.active[2] not in core.AI_REVIEW_STATES:
+            messagebox.showinfo('請選擇 AI 紀錄','請選擇 AI 裝置觀察或 AI 網路研究知識卡。',parent=self); return
+        question=('請先閱讀內容、來源和截圖。選「是」標記為已人工核對；選「否」改回待審核。\n\n'
+                  '人工核對不表示網路研究的指令已在裝置上實測，也不會執行指令。')
+        choice=messagebox.askyesnocancel('審核 AI 紀錄',question,parent=self)
+        if choice is None: return
+        try:
+            detail=core.review_ai_card(self.db_path,self.active[0],choice)
+            self.refresh(); self.master.refresh_metrics(); self.summary.set('已更新審核狀態：'+detail)
+        except Exception as e: messagebox.showerror('無法更新審核狀態',str(e),parent=self)
+    def review_history(self):
+        if not self.active or not self.active[4] or self.active[2] not in core.AI_REVIEW_STATES:
+            messagebox.showinfo('請選擇 AI 紀錄','請選擇 AI 裝置觀察或 AI 網路研究知識卡。',parent=self); return
+        with closing(core.connect(str(self.db_path))) as db:
+            records=db.execute('''SELECT r.reviewed_at,r.previous_detail,r.new_detail,r.content_sha256
+                FROM ai_card_reviews r JOIN documents d ON d.id=r.document_id WHERE d.path=? ORDER BY r.id DESC''',(self.active[0],)).fetchall()
+        w=tk.Toplevel(self); w.title('AI 紀錄審核歷史'); w.geometry('760x460'); w.configure(bg=WHITE); w.transient(self)
+        label(w,'AI 紀錄審核歷史',font=(FONT,15,'bold')).pack(anchor='w',padx=18,pady=(15,5))
+        label(w,'雜湊代表當時的知識卡內容；人工核對不代表已在裝置實測。',fg=MUTED).pack(anchor='w',padx=18)
+        view=tk.Text(w,wrap='word',font=(FONT,10),fg=INK,bg='#f8fafc',bd=0,padx=12,pady=10); view.pack(fill='both',expand=True,padx=18,pady=12)
+        for when,before,after,sha in records: view.insert('end',f'{when}\n{before} → {after}\nSHA-256：{sha}\n\n')
+        if not records: view.insert('end','目前沒有人工審核狀態變更紀錄。')
+        view.configure(state='disabled')
     def copy_selected(self):
         if not self.active: messagebox.showinfo('請先選擇文件','請先選擇已索引的文件。',parent=self); return
         source=self.active[0]

@@ -85,9 +85,11 @@ def save_session(db_path,title,note,images,reviewed=False,existing=None):
     path=core.save_card(str(db_path),title,'來源：'+label+'；截圖保存在知識庫內。\n\n'+note.strip(),existing=existing)
     db=core.connect(str(db_path))
     try:
-        row=db.execute('SELECT id FROM documents WHERE path=?',(path,)).fetchone()
+        row=db.execute('SELECT id,sha256,detail FROM documents WHERE path=?',(path,)).fetchone()
         with db:
             db.execute('UPDATE documents SET detail=? WHERE id=?',(label,row[0]))
+            if reviewed and row[2]!=label:
+                db.execute("INSERT INTO ai_card_reviews(document_id,content_sha256,previous_detail,new_detail,reviewed_at) VALUES(?,?,?,?,datetime('now','localtime'))",(row[0],row[1],row[2],label))
             if existing: db.execute('DELETE FROM device_captures WHERE document_id=?',(row[0],))
             db.executemany("INSERT INTO device_captures(document_id,png,created_at) VALUES(?,?,datetime('now','localtime'))",[(row[0],img) for img in images])
     finally: db.close()

@@ -20,6 +20,12 @@ PLACEHOLDER = 0x1000 | 0x40000 | 0x400000
 REPARSE = 0x400
 MAX_SIZE = 250 * 1024 * 1024
 PARSER_VERSION = '1'
+AI_REVIEW_STATES={
+    'AI 網路研究（指令未經裝置驗證）':('AI 網路研究（指令未經裝置驗證）','AI 網路研究（已人工核對，未經裝置實測）'),
+    'AI 網路研究（已人工核對，未經裝置實測）':('AI 網路研究（指令未經裝置驗證）','AI 網路研究（已人工核對，未經裝置實測）'),
+    'AI 裝置觀察紀錄（尚未人工校對）':('AI 裝置觀察紀錄（尚未人工校對）','使用者校對的 AI 裝置操作紀錄'),
+    '使用者校對的 AI 裝置操作紀錄':('AI 裝置觀察紀錄（尚未人工校對）','使用者校對的 AI 裝置操作紀錄'),
+}
 
 def contained(path, root):
     try:
@@ -54,6 +60,8 @@ def connect(path):
       UNIQUE(document_id,source_sha256,page,language));
     CREATE TABLE IF NOT EXISTS device_captures(id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL REFERENCES documents(id),
       png BLOB NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS ai_card_reviews(id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL REFERENCES documents(id),
+      content_sha256 TEXT NOT NULL, previous_detail TEXT NOT NULL, new_detail TEXT NOT NULL, reviewed_at TEXT NOT NULL);
     ''')
     return db
 
@@ -347,11 +355,14 @@ def save_card(db_path, title, content, existing=None):
         cards.mkdir(parents=True,exist_ok=True)
         card_attrs=getattr(os.stat(cards,follow_symlinks=False),'st_file_attributes',0)
         if cards.is_symlink() or card_attrs & REPARSE: raise ValueError('知識卡資料夾不能是重新解析點')
+        detail='使用者知識卡；非原始文件'
         if existing:
             path=Path(existing)
             if path.parent.resolve()!=cards.resolve() or path.suffix.lower()!='.md' or not re.fullmatch(r'[0-9a-f]{32}\.md',path.name):
                 raise ValueError('只能編輯 APP 建立的知識卡')
             if path.is_symlink() or not path.is_file() or getattr(os.stat(path,follow_symlinks=False),'st_file_attributes',0) & REPARSE: raise ValueError('知識卡不存在或不可編輯')
+            prior=db.execute('SELECT detail FROM documents WHERE path=?',(str(path),)).fetchone()
+            if prior and prior[0] in AI_REVIEW_STATES: detail=AI_REVIEW_STATES[prior[0]][0]
         else: path=cards/(uuid.uuid4().hex+'.md')
         data=('# '+title+'\n\n'+content+'\n').encode('utf-8')
         temp=cards/(uuid.uuid4().hex+'.tmp')
@@ -361,8 +372,34 @@ def save_card(db_path, title, content, existing=None):
         finally:
             if temp.exists(): temp.unlink()
         st=path.stat(); chunks,_=parse(path,data)
-        _record(db,str(path),'.md',st.st_size,st.st_mtime_ns,hashlib.sha256(data).hexdigest(),'indexed','使用者知識卡；非原始文件',chunks)
+        _record(db,str(path),'.md',st.st_size,st.st_mtime_ns,hashlib.sha256(data).hexdigest(),'indexed',detail,chunks)
+        if existing and prior and prior[0] in AI_REVIEW_STATES and prior[0]!=detail:
+            row=db.execute('SELECT id FROM documents WHERE path=?',(str(path),)).fetchone()
+            with db: db.execute("INSERT INTO ai_card_reviews(document_id,content_sha256,previous_detail,new_detail,reviewed_at) VALUES(?,?,?,?,datetime('now','localtime'))",(row[0],hashlib.sha256(data).hexdigest(),prior[0],detail))
         return str(path)
+    finally: db.close()
+
+def review_ai_card(db_path,path,reviewed):
+    """Record explicit human review against exact indexed card bytes."""
+    if type(reviewed) is not bool: raise ValueError('審核狀態無效')
+    db_path=Path(db_path).resolve(); cards=db_path.parent/'cards'; path=Path(path)
+    if path.parent.resolve()!=cards.resolve() or not re.fullmatch(r'[0-9a-f]{32}\.md',path.name): raise ValueError('只能審核 APP 建立的 AI 知識卡')
+    if path.is_symlink() or not path.is_file() or getattr(os.stat(path,follow_symlinks=False),'st_file_attributes',0)&REPARSE: raise ValueError('知識卡不存在或不可審核')
+    data=path.read_bytes()
+    if len(data)>1024*1024: raise ValueError('知識卡過大')
+    digest=hashlib.sha256(data).hexdigest(); db=connect(str(db_path))
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        row=db.execute('SELECT id,sha256,detail,status FROM documents WHERE path=?',(str(path),)).fetchone()
+        if not row or row[3]!='indexed' or row[1]!=digest: raise ValueError('知識卡已變更，請重新載入後再審核')
+        if row[2] not in AI_REVIEW_STATES: raise ValueError('這不是可審核的 AI 產生知識卡')
+        target=AI_REVIEW_STATES[row[2]][1 if reviewed else 0]
+        if target!=row[2]:
+            db.execute('UPDATE documents SET detail=? WHERE id=?',(target,row[0]))
+            db.execute("INSERT INTO ai_card_reviews(document_id,content_sha256,previous_detail,new_detail,reviewed_at) VALUES(?,?,?,?,datetime('now','localtime'))",(row[0],digest,row[2],target))
+        db.commit(); return target
+    except Exception:
+        db.rollback(); raise
     finally: db.close()
 
 def chinese_variants(text):
