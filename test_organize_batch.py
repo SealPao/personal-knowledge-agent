@@ -121,6 +121,13 @@ class TestBatch(unittest.TestCase):
   result,chosen,_=ai_service.answer('怎麼調整前光？',refs,'openai','fake','fake',post=fake,network_enabled=True)
   self.assertIn('[1]',result);self.assertIn('[2]',result);self.assertEqual({x['origin']['path'] for x in chosen},{str(self.doc.resolve()),str(other.resolve())})
 
+ def test_missing_frontlight_aspect_only_adds_verbatim_support(self):
+  import ai_service
+  sources=[{'id':1,'excerpt':'前光亮度：在控制中心拖動亮度滑桿。'},{'id':2,'excerpt':'前光色溫：在控制中心拖動色溫滑桿。'}]
+  extra=ai_service._frontlight_missing_aspects('如何調整前光亮度和色溫？','調整亮度',sources)
+  self.assertEqual([(x['id'],q) for x,q in extra],[(2,'前光色溫：在控制中心拖動色溫滑桿。')])
+  self.assertFalse(ai_service._frontlight_missing_aspects('如何調整前光亮度？','調整亮度',sources))
+
  def test_source_changes_before_approval_are_rejected(self):
   job=b.create(self.db,self.cfg,100000)
   with patch.object(b.ai_service,'answer',return_value=('草稿 [1]',[{'id':1}],{})):b.run(self.db,job)

@@ -526,6 +526,21 @@ def extract_relevant_steps(question,sources):
     return '\n'.join(lines),selected
 
 
+def _frontlight_missing_aspects(question,answer,sources):
+    # Quote an explicitly requested, omitted aspect only when a source states an action.
+    if not _question_topics(question) or not any(x in question.lower() for x in ('前光','frontlight','front light')): return []
+    aspects=(('亮度','亮度'),('色溫','色溫'),('色温','色温'),('冷暖','冷暖'))
+    actions=('滑動','拖動','調整','點選','開啟','滑动','拖动','调整','点击','开启')
+    found=[]; seen=set()
+    for query_word,source_word in aspects:
+        if query_word not in question or query_word in answer: continue
+        for source in sources:
+            pieces=re.split(r'(?<=[。！？!?；;])|\n+',source.get('excerpt',''))
+            quote=next((x.strip() for x in pieces if source_word in x and any(a in x for a in actions) and 3<=len(x.strip())<=300),None)
+            if quote and (source['id'],quote) not in seen:
+                seen.add((source['id'],quote));found.append((source,quote));break
+    return found
+
 def _insufficient_evidence(question,segments):
     """Use an actual relevant source sentence explicitly saying information is absent."""
     marks=('沒有說明','未說明','沒有記載','未記載','未提及','未提供','沒有提供','資料不足','無法確認')
@@ -716,6 +731,12 @@ def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434
             if _possible_missed_steps(body,question,sources,ids): alerts.append('來源可能包含相關操作，AI 稱資料不足時仍請核對')
             warning=('⚠ '+'；'.join(alerts)+'。請檢查完整來源。\n\n') if alerts else ''
             text=warning+'\n'.join(lines)+'\n\n每項後方顯示對照原文；編號與原文已核對，對應關係及操作是否正確仍需人工確認。'
+            extra=_frontlight_missing_aspects(question,body,sources)
+            if extra:
+                text+='\n\n可能遺漏的相關來源摘錄（請核對機型與適用性）：'
+                for source,quote in extra:
+                    text+='\n補充摘錄 ['+str(source['id'])+']：'+quote
+                    ids.append(source['id'])
         usage=response.get('usage',{})
     else: raise ValueError('未知的 AI 服務')
     if not text: raise RuntimeError('模型沒有傳回文字；請檢查模型與服務設定')
