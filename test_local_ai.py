@@ -10,6 +10,23 @@ import ai_service
 import device_agent
 from PIL import Image
 
+def claim_response(post):
+    # Adapt historical quote fixtures to request-scoped claim IDs.
+    def wrapped(url,headers,payload):
+        response=post(url,headers,payload)
+        content=response['choices'][0]['message']['content']; parsed=json.loads(content)
+        if 'items' in parsed: return response
+        source_input=json.loads(payload['messages'][1]['content'])
+        segments={piece['segment_id']:(source['id'],piece['text']) for source in source_input['sources'] for piece in source['segments']}
+        evidence=parsed.get('evidence',[]); selected=[]
+        for quote in evidence:
+            selected.append(next((i for i,(sid,text) in segments.items() if sid==quote['source_id'] and quote['quote'] in text),999))
+        if not selected: selected=parsed.get('evidence_ids',[])
+        answer=__import__('re').sub(r'\s*\[\d+\]','',parsed['answer']).strip()
+        response['choices'][0]['message']['content']=json.dumps({'items':[{'text':answer,'evidence_ids':selected}]},ensure_ascii=False)
+        return response
+    return wrapped
+
 class LocalModelTests(unittest.TestCase):
     def test_download_verifies_and_resumes_completed_file(self):
         files=(('text.gguf',4,hashlib.sha256(b'text').hexdigest()),('vision.gguf',6,hashlib.sha256(b'vision').hexdigest()))
@@ -122,7 +139,7 @@ class LocalModelTests(unittest.TestCase):
             content=json.dumps({'answer':'長按電源鍵，選擇關機 [1]','citations':[1],'evidence_ids':[1]},ensure_ascii=False)
             return {'choices':[{'message':{'content':content}}]}
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
-            text,refs,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+            text,refs,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
         self.assertEqual(len(calls),1); self.assertEqual(refs,sources); self.assertIn(sources[0]['excerpt'],text)
     def test_repeated_irrelevant_text_does_not_hide_relevant_steps(self):
         noise='本文件介紹閱讀器設定與使用說明。'*35
@@ -132,6 +149,40 @@ class LocalModelTests(unittest.TestCase):
         self.assertTrue(any('選擇全螢幕顯示' in text for text in texts))
         self.assertEqual(sum('本文件介紹閱讀器設定與使用說明。'==t for t in texts),1)
         self.assertTrue(all(t in original for t in texts)); self.assertLess(len(content),len(original))
+    def test_claims_require_valid_per_item_evidence(self):
+        segments={1:(1,'Era 長按電源鍵。'),2:(2,'Verse 短按電源鍵。')}
+        def raw(items): return json.dumps({'items':items},ensure_ascii=False)
+        with self.assertRaises(ValueError): ai_service._checked_claims(raw([{'text':'Era 長按','evidence_ids':[]}]),segments)
+        with self.assertRaises(ValueError): ai_service._checked_claims(raw([{'text':'Era 長按','evidence_ids':[999]}]),segments)
+        with self.assertRaises(ValueError): ai_service._checked_claims(raw([{'text':'Era 長按 [2]','evidence_ids':[1]}]),segments)
+        claims=ai_service._checked_claims(raw([{'text':'Era 長按','evidence_ids':[1]},{'text':'Verse 短按','evidence_ids':[2]}]),segments)
+        self.assertEqual(claims[0][1],[(1,'Era 長按電源鍵。')]); self.assertEqual(claims[1][1],[(2,'Verse 短按電源鍵。')])
+        self.assertTrue(ai_service._claim_warning('長按電源鍵',[(2,'Verse 短按電源鍵。')]))
+    def test_same_source_strong_match_repairs_wrong_segment_without_crossing_document(self):
+        segments={1:(1,'在快捷選單使用前光滑桿調整亮度。'),2:(1,'注意不要將裝置浸入水中。'),3:(2,'注意不要將裝置浸入水中。')}
+        quotes,changed=ai_service._claim_anchor('注意事項：不要將裝置浸入水中。',[segments[1]],segments)
+        self.assertTrue(changed); self.assertEqual(quotes,[segments[2]])
+        self.assertTrue(ai_service._claim_warning('不要浸水',[segments[1]]))
+        self.assertNotIn('限制或警告未在所選原文中確認',ai_service._claim_warning('不要浸水',quotes))
+    def test_ambiguous_same_source_does_not_guess_anchor(self):
+        segments={1:(1,'請開啟設定。'),2:(1,'不要浸入水中。'),3:(1,'請不要浸入水中。')}
+        quotes,changed=ai_service._claim_anchor('不要浸入水中',[segments[1]],segments)
+        self.assertFalse(changed); self.assertEqual(quotes,[segments[1]])
+    def test_unique_model_name_repairs_wrong_document(self):
+        sources=[{'id':1,'path':'PocketBook Era.md'}, {'id':2,'path':'PocketBook Verse.md'}]
+        segments={1:(1,'PocketBook Era：長按電源鍵，選擇關機。'),2:(2,'PocketBook Verse：短按電源鍵，選擇關機。')}
+        quotes,changed=ai_service._claim_model_anchor('PocketBook Verse：短按電源鍵，選擇關機。',[segments[1]],segments,sources)
+        self.assertTrue(changed); self.assertEqual(quotes,[segments[2]])
+        quotes,changed=ai_service._claim_model_anchor('PocketBook：短按電源鍵，選擇關機。',[segments[1]],segments,sources)
+        self.assertFalse(changed); self.assertEqual(quotes,[segments[1]])
+        quotes,changed=ai_service._claim_model_anchor('PocketBook Era 和 Verse 如何關機？',[segments[1]],segments,sources)
+        self.assertFalse(changed); self.assertEqual(quotes,[segments[1]])
+    def test_no_claims_returns_clear_abstention(self):
+        sources=[{'id':1,'excerpt':'僅有充電說明。'}]
+        def post(url,headers,payload): return {'choices':[{'message':{'content':'{"items":[]}'}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,refs,_=ai_service.answer('如何重置',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertIn('不足以支持回答',text); self.assertEqual(refs,[])
     def test_auth_only_for_current_local_server(self):
         class Proc:
             def poll(self): return None
@@ -158,16 +209,16 @@ class LocalModelTests(unittest.TestCase):
         def post(url,headers,payload):
             return {'choices':[{'message':{'content':'{"answer":"設定在系統選單","citations":[1],"evidence":[{"source_id":1,"quote":"設定在系統選單"}]}'}}]}
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
-            text,citations,_=ai_service.answer('設定在哪裡',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
-        self.assertIn('[1]',text); self.assertIn('供核對的來源片段文字',text); self.assertIn('設定在系統選單',text); self.assertEqual(citations,sources)
+            text,citations,_=ai_service.answer('設定在哪裡',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
+        self.assertIn('[1]',text); self.assertIn('原文 [1]',text); self.assertIn('設定在系統選單',text); self.assertEqual(citations,sources)
     def test_builtin_retries_and_rejects_fabricated_quote(self):
         sources=[{'id':1,'excerpt':'進入設定頁面'}]; calls=[]
         def post(url,headers,payload):
             calls.append(1)
             return {'choices':[{'message':{'content':'{"answer":"完成","citations":[1],"evidence":[{"source_id":1,"quote":"已執行重置"}]}'}}]}
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
-            with self.assertRaisesRegex(RuntimeError,'來源原文'):
-                ai_service.answer('問題',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+            with self.assertRaisesRegex(RuntimeError,'逐項來源'):
+                ai_service.answer('問題',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
         self.assertEqual(len(calls),2)
     def test_quote_must_match_the_corresponding_source(self):
         sources=[{'id':1,'excerpt':'第一台長按'},{'id':2,'excerpt':'第二台短按'}]
@@ -181,7 +232,7 @@ class LocalModelTests(unittest.TestCase):
             content=json.dumps({'answer':'長按電源鍵 [1]','citations':[1],'evidence':[{'source_id':1,'quote':quote}]},ensure_ascii=False)
             return {'choices':[{'message':{'content':content}}]}
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
-            text,cited,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+            text,cited,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
         self.assertEqual(len(calls),2); self.assertIn('長按電源鍵以關機',text); self.assertNotIn('按一下電源鍵',text); self.assertEqual(cited,sources)
     def test_number_in_source_quote_is_not_treated_as_citation(self):
         sources=[{'id':1,'excerpt':'原文標記 [99] 為文件編號'}]
@@ -189,7 +240,7 @@ class LocalModelTests(unittest.TestCase):
             content=json.dumps({'answer':'文件編號見來源 [1]','citations':[1],'evidence':[{'source_id':1,'quote':'原文標記 [99] 為文件編號'}]},ensure_ascii=False)
             return {'choices':[{'message':{'content':content}}]}
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
-            text,cited,_=ai_service.answer('文件編號',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+            text,cited,_=ai_service.answer('文件編號',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
         self.assertIn('[99]',text); self.assertEqual(cited,sources)
     def test_warns_when_long_press_or_selection_is_omitted(self):
         sources=[{'id':1,'excerpt':'長按電源鍵，選擇關機。'}]
@@ -197,7 +248,7 @@ class LocalModelTests(unittest.TestCase):
             content=json.dumps({'answer':'按下電源鍵 [1]','citations':[1],'evidence':[{'source_id':1,'quote':'長按電源鍵，選擇關機。'}]},ensure_ascii=False)
             return {'choices':[{'message':{'content':content}}]}
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
-            text,_,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+            text,_,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
         self.assertIn('回答可能遺漏',text); self.assertIn('長按',text); self.assertIn('選擇',text)
     def test_checks_relevant_sentence_even_if_model_quotes_only_part(self):
         sources=[{'id':1,'excerpt':'長按電源鍵，選擇關機。不要浸水。'}]
@@ -213,7 +264,7 @@ class LocalModelTests(unittest.TestCase):
             content=json.dumps({'answer':'來源並無記載如何關機 [1]','citations':[1],'evidence':[{'source_id':1,'quote':'裝置電源'}]},ensure_ascii=False)
             return {'choices':[{'message':{'content':content}}]}
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
-            text,_,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+            text,_,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
         self.assertIn('來源可能包含相關操作',text)
     def test_unrelated_source_does_not_trigger_missing_steps_warning(self):
         sources=[{'id':1,'excerpt':'使用前光亮度滑桿調整。'}]

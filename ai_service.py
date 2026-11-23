@@ -1,5 +1,6 @@
 """Provider-agnostic retrieval and cited answers; does not store questions or secrets."""
 import ctypes
+import difflib
 import hashlib
 from ctypes import wintypes
 import json
@@ -288,6 +289,75 @@ def _checked_segment_evidence(raw,segments):
     if not {int(n) for n in re.findall(r'\[(\d+)\]',body)}.issubset(set(ids)): raise ValueError()
     return body.strip(),ids,quotes
 
+def _checked_claims(raw,segments):
+    """Validate each independently cited statement against request-scoped segments."""
+    parsed=json.loads(raw)
+    if not isinstance(parsed,dict) or not isinstance(parsed.get('items'),list): raise ValueError()
+    items=parsed['items']
+    if len(items)>12: raise ValueError()
+    checked=[]
+    for item in items:
+        if not isinstance(item,dict): raise ValueError()
+        body=item.get('text'); evidence=item.get('evidence_ids')
+        if not isinstance(body,str) or not body.strip() or len(body)>500 or '\n' in body or re.search(r'\[\d+\]',body): raise ValueError()
+        if not isinstance(evidence,list) or not 1<=len(evidence)<=4: raise ValueError()
+        if any(type(i) is not int or i not in segments for i in evidence): raise ValueError()
+        quotes=[segments[i] for i in dict.fromkeys(evidence)]
+        checked.append((body.strip(),quotes))
+    return checked
+
+
+def _claim_anchor(body,quotes,segments):
+    """Repair a unique strong verbatim match within the same cited source only."""
+    if len(quotes)!=1: return quotes,False
+    source_id,original=quotes[0]
+    def match(text):
+        return difflib.SequenceMatcher(None,body,text,autojunk=False).find_longest_match().size
+    baseline=match(original)
+    candidates=[(match(text),text) for sid,text in segments.values() if sid==source_id and text!=original]
+    if not candidates: return quotes,False
+    best=max(score for score,_ in candidates)
+    winners=[text for score,text in candidates if score==best]
+    if best>=6 and best>=baseline+4 and len(winners)==1:
+        return [(source_id,winners[0])],True
+    return quotes,False
+
+
+def _claim_model_anchor(body,quotes,segments,sources):
+    """Repair wrong-document citation only for a unique explicit model name."""
+    if len(quotes)!=1: return quotes,False
+    tokens=[t.lower() for t in re.findall(r'[A-Za-z][A-Za-z0-9._+-]{2,}',body) if t.lower() not in GENERIC_FILENAME_TERMS]
+    matched=set()
+    for token in dict.fromkeys(tokens):
+        owners={source['id'] for source in sources if source.get('path') and re.search(r'(?<![a-z0-9])'+re.escape(token)+r'(?![a-z0-9])',Path(source['path']).stem.lower())}
+        if len(owners)==1: matched.update(owners)
+    if len(matched)!=1: return quotes,False
+    desired=next(iter(matched))
+    if desired==quotes[0][0]: return quotes,False
+    candidates=[]
+    for sid,text in segments.values():
+        if sid==desired:
+            score=difflib.SequenceMatcher(None,body,text,autojunk=False).find_longest_match().size
+            candidates.append((score,text))
+    if not candidates: return quotes,False
+    best=max(score for score,_ in candidates); winners=[text for score,text in candidates if score==best]
+    if best<6 or len(winners)!=1: return quotes,False
+    return [(desired,winners[0])],True
+
+
+def _claim_warning(body,quotes):
+    """Flag clear conflicting operation terms; this is not semantic verification."""
+    text=' '.join(q for _,q in quotes)
+    warnings=[]
+    if max((difflib.SequenceMatcher(None,body,quote,autojunk=False).find_longest_match().size for _,quote in quotes),default=0)<4:
+        warnings.append('回答與所選原文的文字關聯較弱')
+    if any(word in body for word in ('不要','不可','不得','請勿','切勿')) and not any(word in text for word in ('不要','不可','不得','請勿','切勿')):
+        warnings.append('限制或警告未在所選原文中確認')
+    for claimed,opposite in (('長按','短按'),('短按','長按')):
+        if claimed in body and opposite in text and claimed not in text:
+            warnings.append('按鍵操作可能與引用原文相反')
+    return warnings
+
 class EvidenceError(RuntimeError):
     """A model answer could not be tied to exact source text."""
 
@@ -358,38 +428,46 @@ def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434
         if model==local_ai.MODEL:
             local_content,segments=_local_segment_input(question,sources)
             payload['messages'][1]['content']=local_content
-            payload['messages'][0]['content']=INSTRUCTIONS.replace('每項重要事實後標註 [數字]，數字只能使用提供的來源 id。','回答中不要加來源編號。')
-            payload['messages'][0]['content']+=' 回傳 JSON：answer 是回答，evidence_ids 是支持回答的 segment_id 整數陣列，只能選輸入中存在的 segment_id。'
-            payload['response_format']={'type':'json_schema','schema':{'type':'object','properties':{'answer':{'type':'string'},'evidence_ids':{'type':'array','items':{'type':'integer'}}},'required':['answer','evidence_ids'],'additionalProperties':False}}
+            payload['messages'][0]['content']=INSTRUCTIONS.replace('每項重要事實後標註 [數字]，數字只能使用提供的來源 id。','回答中不要自行加入來源編號。')
+            payload['messages'][0]['content']+=' 回傳 JSON：items 是回答中的步驟或事實陣列，每項包含 text 和 evidence_ids。每一項只寫一個步驟或事實，evidence_ids 必須填支持該項的 segment_id 整數。沒有相關資料時 items 填空陣列。不得使用未對應的片段或將不同機型的步驟混用。'
+            item_schema={'type':'object','properties':{'text':{'type':'string'},'evidence_ids':{'type':'array','items':{'type':'integer'}}},'required':['text','evidence_ids'],'additionalProperties':False}
+            payload['response_format']={'type':'json_schema','schema':{'type':'object','properties':{'items':{'type':'array','items':item_schema}},'required':['items'],'additionalProperties':False}}
             payload['temperature']=0
         response=post(local_endpoint(base),{'Content-Type':'application/json'},payload)
         choices=response.get('choices') or []; text=(choices[0].get('message',{}).get('content') or '').strip() if choices else ''
         if model==local_ai.MODEL:
             for attempt in range(2):
                 try:
-                    parsed=json.loads(text)
-                    if 'evidence_ids' in parsed: body,ids,quotes=_checked_segment_evidence(text,segments)
-                    else:
-                        body,ids,quotes=_checked_evidence(text,sources)
-                        if any(not any(ident==sid and quote in selected for sid,selected in segments.values()) for ident,quote in quotes): raise ValueError()
-                    break
+                    claims=_checked_claims(text,segments); break
                 except (ValueError,TypeError,KeyError,AttributeError):
-                    if attempt: raise EvidenceError('本地模型未提供可核對的來源原文；請重試、提高輸出上限或查看來源。') from None
-                    payload['messages'][0]['content']+=' 請從輸入的 segment_id 選取存在且相關的數字放入 evidence_ids。'
+                    if attempt: raise EvidenceError('本地模型未提供可核對的逐項來源；請重試、提高輸出上限或查看來源。') from None
+                    payload['messages'][0]['content']+=' 每一項 evidence_ids 必須包含輸入中確實存在的 segment_id；不確定時請回傳空 items。'
                     response=post(local_endpoint(base),{'Content-Type':'application/json'},payload)
                     choices=response.get('choices') or []; text=(choices[0].get('message',{}).get('content') or '').strip() if choices else ''
-            missing=_missing_operation_markers(body,quotes,question,sources)
+            if not claims:
+                return '目前的搜尋片段不足以支持回答；請換個問題或查看原始文件。',[],response.get('usage',{})
+            lines=[]; ids=[]; all_quotes=[]
+            for number,(body,quotes) in enumerate(claims,1):
+                quotes,model_reanchored=_claim_model_anchor(body,quotes,segments,sources)
+                quotes,reanchored=_claim_anchor(body,quotes,segments)
+                claim_ids=list(dict.fromkeys(ident for ident,_ in quotes)); ids.extend(claim_ids); all_quotes.extend(quotes)
+                warning=_claim_warning(body,quotes)
+                lines.append(str(number)+'. '+body+' '+''.join(f'[{i}]' for i in claim_ids))
+                if warning: lines.append('   ⚠ '+'；'.join(warning)+'，請核對原文。')
+                if model_reanchored: lines.append('   已依回答中的明確機型名稱調整來源，仍須確認。')
+                elif reanchored: lines.append('   已依相同文件中的原文文字調整片段，仍須確認。')
+                for ident,quote in quotes: lines.append('   原文 ['+str(ident)+']：'+quote.strip())
+            body='\n'.join(x[0] for x in claims)
+            missing=_missing_operation_markers(body,all_quotes,question,sources)
             alerts=[]
             if missing: alerts.append('回答可能遺漏來源中的操作或限制（'+ '、'.join(missing)+'）')
             if _possible_missed_steps(body,question,sources,ids): alerts.append('來源可能包含相關操作，AI 稱資料不足時仍請核對')
-            warning=('⚠ '+'；'.join(alerts)+'。請檢查右側完整來源片段。\n\n') if alerts else ''
-            text=warning+body+'\n\n本回答參考的來源：'+' '.join(f'[{i}]' for i in ids)
+            warning=('⚠ '+'；'.join(alerts)+'。請檢查完整來源。\n\n') if alerts else ''
+            text=warning+'\n'.join(lines)+'\n\n每項後方顯示對照原文；編號與原文已核對，對應關係及操作是否正確仍需人工確認。'
         usage=response.get('usage',{})
     else: raise ValueError('未知的 AI 服務')
     if not text: raise RuntimeError('模型沒有傳回文字；請檢查模型與服務設定')
-    cited={int(n) for n in re.findall(r'\[(\d+)\]',text)}; valid={s['id'] for s in sources}
+    cited=set(ids) if provider=='local' and model==local_ai.MODEL else {int(n) for n in re.findall(r'\[(\d+)\]',text)}; valid={s['id'] for s in sources}
     if not cited or not cited.issubset(valid):
         raise RuntimeError('模型未提供有效來源編號，無法安全顯示回答；請換個問題或重試')
-    if provider=='local' and model==local_ai.MODEL:
-        text+='\n\n供核對的來源片段文字（已對照原文；回答各項敘述仍需人工核對，來源可能是 OCR 或 AI 衍生內容）：\n'+'\n'.join(f'[{ident}] 「{quote}」' for ident,quote in quotes)
     return text,[s for s in sources if s['id'] in cited],usage
