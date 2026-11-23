@@ -143,7 +143,11 @@ def run(path,job,cancelled=lambda:False,progress=lambda x:None):
         row=db.execute('SELECT config,token_limit,reserved,state FROM organize_jobs WHERE id=?',(job,)).fetchone()
         if not row or row[3]=='running': raise ValueError('工作不存在或正在執行。')
         config=json.loads(row[0]);limit=row[1]
-        if ai_ui.read_config(Path(path).parent/'ai-settings.json')!=config: raise ValueError('AI 設定已變更；請建立新工作，避免混用模型。')
+        current=ai_ui.read_config(Path(path).parent/'ai-settings.json')
+        if any(config.get(k)!=current.get(k) for k in ('provider','openai_model','local_model','local_base','network_enabled')):
+            raise ValueError('AI 服務、模型或連線設定已變更；請建立新工作，避免混用模型。')
+        config={**config,'max_tokens':current['max_tokens'],'auto_start_local':current['auto_start_local']}
+        db.execute('UPDATE organize_jobs SET config=? WHERE id=?',(json.dumps(config,ensure_ascii=False),job))
         if db.execute("SELECT count(*) FROM organize_items WHERE job_id=? AND state='unknown'",(job,)).fetchone()[0]: raise ValueError('有中斷後用量未知的項目；請先人工檢查，不能自動重試。')
         prompt_rows=db.execute("SELECT id,path FROM organize_items WHERE job_id=? AND state='pending'",(job,)).fetchall()
         db.executemany("UPDATE organize_items SET state='skipped',detail='提示詞與一般知識分開，未送 AI 整理。' WHERE id=?",[(ident,) for ident,path in prompt_rows if is_prompt(path)])
@@ -185,11 +189,12 @@ def run(path,job,cancelled=lambda:False,progress=lambda x:None):
             if used+ceiling>limit:
                 db.rollback();progress('達到整個工作的 Token 預留上限，已暫停。');break
             db.execute("UPDATE organize_items SET state='running',reserved=? WHERE id=?",(ceiling,ident));db.execute('UPDATE organize_jobs SET reserved=reserved+? WHERE id=?',(ceiling,job));db.commit()
-            ticket=None
+            ticket=None;attempted=False
             try:
                 key=ai_service.load_key() if config['provider']=='openai' else None
                 model=config['openai_model'] if config['provider']=='openai' else config['local_model']
                 if config['provider']=='openai': ticket=budget.reserve(path,QUESTION,[source],model,maximum)
+                attempted=True
                 text,used_sources,usage=ai_service.answer(QUESTION,[source],config['provider'],model,key,config['local_base'],maximum,network_enabled=config['network_enabled'])
                 if ticket: budget.finish(path,ticket,usage);ticket=None
                 if not used_sources: raise ValueError('AI 草稿沒有可核對來源。')
@@ -201,7 +206,11 @@ def run(path,job,cancelled=lambda:False,progress=lambda x:None):
                         if isinstance(e,ai_service.IncompleteResponse): budget.finish(path,ticket,e.usage);ticket=None
                         else: budget.uncertain(path,ticket)
                     except Exception: pass
-                with db: db.execute("UPDATE organize_items SET state=?,detail=? WHERE id=?",('unknown' if ticket else 'failed',str(e)[:500],ident))
+                with db:
+                    if not attempted:
+                        db.execute('UPDATE organize_jobs SET reserved=reserved-? WHERE id=?',(ceiling,job))
+                        db.execute('UPDATE organize_items SET reserved=0 WHERE id=?',(ident,))
+                    db.execute("UPDATE organize_items SET state=?,detail=? WHERE id=?",('unknown' if ticket else 'failed',str(e)[:500],ident))
                 break
         with db:
             left=db.execute("SELECT count(*) FROM organize_items WHERE job_id=? AND state='pending'",(job,)).fetchone()[0]

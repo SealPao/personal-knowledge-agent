@@ -74,6 +74,18 @@ class TestBatch(unittest.TestCase):
    with patch.object(b.budget,'reserve',return_value='ticket'),patch.object(b.budget,'finish') as finish,patch.object(b.budget,'uncertain') as uncertain,patch.object(b.ai_service,'answer',side_effect=error):b.run(self.db,job)
   finish.assert_called_once_with(self.db,'ticket',error.usage);uncertain.assert_not_called();self.assertEqual(b.stats(self.db,job)['counts']['failed'],1)
 
+ def test_budget_rejection_releases_unused_job_reservation(self):
+  config={**self.cfg,'provider':'openai','network_enabled':True};ai_ui.write_config(self.db.parent/'ai-settings.json',config)
+  with patch.object(b.ai_service,'load_key',return_value='fake'):
+   job=b.create(self.db,config,100000)
+   with patch.object(b.budget,'reserve',side_effect=ValueError('超過月預算')),patch.object(b.ai_service,'answer') as answer:b.run(self.db,job)
+  answer.assert_not_called();self.assertEqual(b.stats(self.db,job)['reserved'],0);self.assertEqual(b.stats(self.db,job)['counts']['failed'],1)
+
+ def test_output_limit_can_change_without_restarting_job(self):
+  job=b.create(self.db,self.cfg,100000);ai_ui.write_config(self.db.parent/'ai-settings.json',{**self.cfg,'max_tokens':200})
+  with patch.object(b.ai_service,'answer',return_value=('草稿 [1]',[{'id':1}],{})) as answer:b.run(self.db,job)
+  self.assertEqual(answer.call_args.args[6],200);self.assertEqual(b.stats(self.db,job)['counts']['review'],1)
+
  def test_pause_resume_and_review(self):
   job=b.create(self.db,self.cfg,100000);b.run(self.db,job,lambda:True);self.assertEqual(b.stats(self.db,job)['counts']['pending'],1)
   with patch.object(b.ai_service,'answer',return_value=('整理 [1]',[{'id':1}],{})) as answer:b.run(self.db,job);self.assertEqual(answer.call_count,1)
