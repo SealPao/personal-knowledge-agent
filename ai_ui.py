@@ -485,11 +485,13 @@ class AIWindow(tk.Toplevel):
         if not selected: return
         s=self.sources_by_row[int(selected[0])]
         state=svc.source_state(s)
-        self._source_text((state+'。\n' if state else '')+'來源類型：'+(s.get('scope_warning') or s.get('kind','未確認'))+'\n'+s['path']+'\n'+s['locator']+'\n\n'+s['excerpt']+'\n\n逐項引用：\n'+getattr(self,'last_details',''))
+        origin=s.get('origin'); origin_text=('\n\n原始來源：'+origin['path']+'\n'+origin['locator']+'\n\n原始片段：\n'+origin['excerpt']) if origin else ''
+        self._source_text((state+'。\n' if state else '')+'來源類型：'+(s.get('scope_warning') or s.get('kind','未確認'))+'\n'+s['path']+'\n'+s['locator']+'\n\n'+s['excerpt']+origin_text+'\n\n逐項引用：\n'+getattr(self,'last_details',''))
     def open_source(self):
         selected=self.cites.selection()
         if not selected: return
         source=self.sources_by_row[int(selected[0])]; state=svc.source_state(source)
+        if source.get('origin'): source=source['origin']
         if state: messagebox.showwarning('來源目前無法開啟',state,parent=self); return
         if source.get('kind')==web_search.KIND:
             if not web_search.safe_public_url(source.get('url')): messagebox.showerror('網址無效','無法開啟此網路來源。',parent=self); return

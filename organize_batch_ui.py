@@ -1,5 +1,5 @@
 """Window for durable, explicitly started organization jobs."""
-import queue, threading, time, tkinter as tk
+import os, queue, threading, time, tkinter as tk
 from tkinter import ttk,messagebox
 from pathlib import Path
 import organize_batch as batch, ai_ui, budget
@@ -19,6 +19,7 @@ class OrganizeBatchWindow(tk.Toplevel):
         tk.Button(bar,text='暫停',command=self.cancel.set).pack(side='left',padx=4)
         tk.Button(bar,text='重試失敗項目',command=self.retry).pack(side='left',padx=4)
         tk.Button(bar,text='略過未知項目',command=self.skip_unknown).pack(side='left',padx=4)
+        tk.Button(self,text='審核選取的 AI 草稿並加入搜尋',command=self.review).pack(anchor='w',padx=20,pady=(0,3))
         self.progress=ttk.Progressbar(self,maximum=100);self.progress.pack(fill='x',padx=20,pady=5)
         self.status=tk.StringVar();tk.Label(self,textvariable=self.status,justify='left',anchor='w',wraplength=940).pack(fill='x',padx=20,pady=5)
         tk.Label(self,textvariable=self.current,justify='left',anchor='w',wraplength=940).pack(fill='x',padx=20)
@@ -57,17 +58,43 @@ class OrganizeBatchWindow(tk.Toplevel):
         self.last_refresh=time.monotonic()
         if not self.job:self.status.set('尚無整理工作。請先匯入文件並設定 AI。');return
         info=batch.stats(self.db,self.job);counts=info['counts'];self.progress['value']=100*info['processed']/max(info['documents'],1)
-        self.status.set(f"文件已處理 {info['processed']} / {info['documents']}；待執行片段 {counts.get('pending',0)}，待校對 {counts.get('review',0)}，失敗 {counts.get('failed',0)}，略過 {counts.get('skipped',0)}，狀態未知 {counts.get('unknown',0)}。\nToken 保守預留 {info['reserved']} / {info['limit']}；這不是官方實際用量。完成比例包含待校對及失敗文件。")
+        self.status.set(f"文件已處理 {info['processed']} / {info['documents']}；待執行片段 {counts.get('pending',0)}，待校對 {counts.get('review',0)}，已加入搜尋 {counts.get('published',0)}，失敗 {counts.get('failed',0)}，略過 {counts.get('skipped',0)}，狀態未知 {counts.get('unknown',0)}。\nToken 保守預留 {info['reserved']} / {info['limit']}；這不是官方實際用量。完成比例包含待校對及失敗文件。")
         db=batch.connect(self.db)
-        try:self.rows=db.execute("SELECT path,locator,state,result,detail FROM organize_items WHERE job_id=? ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'unknown' THEN 1 WHEN 'failed' THEN 2 WHEN 'pending' THEN 3 WHEN 'review' THEN 4 ELSE 5 END,id LIMIT 300",(self.job,)).fetchall()
+        try:self.rows=db.execute("SELECT id,path,locator,state,result,detail FROM organize_items WHERE job_id=? ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'unknown' THEN 1 WHEN 'failed' THEN 2 WHEN 'review' THEN 3 WHEN 'pending' THEN 4 ELSE 5 END,id LIMIT 300",(self.job,)).fetchall()
         finally:db.close()
         self.tree.delete(*self.tree.get_children())
-        states={'pending':'待處理','running':'處理中','review':'待校對','failed':'失敗','skipped':'略過','unknown':'中斷待檢查'}
-        for i,(path,loc,state,result,detail) in enumerate(self.rows):self.tree.insert('','end',iid=str(i),values=(Path(path).name,loc,states.get(state,state)))
+        states={'pending':'待處理','running':'處理中','review':'待校對','failed':'失敗','skipped':'略過','unknown':'中斷待檢查','published':'已加入搜尋'}
+        for i,(item_id,path,loc,state,result,detail) in enumerate(self.rows):self.tree.insert('','end',iid=str(i),values=(Path(path).name,loc,states.get(state,state)))
     def select(self,event=None):
         sel=self.tree.selection()
         if not sel:return
-        path,loc,state,result,detail=self.rows[int(sel[0])];self.details.delete('1.0','end');self.details.insert('1.0',f'{Path(path).name} · {loc}\n{detail}\n\n{result}')
+        item_id,path,loc,state,result,detail=self.rows[int(sel[0])];self.details.delete('1.0','end');self.details.insert('1.0',f'{Path(path).name} · {loc}\n{detail}\n\n{result}')
+    def review(self):
+        if self.busy:messagebox.showinfo('整理中','請先暫停整理再審核。',parent=self);return
+        selected=self.tree.selection()
+        if not selected:messagebox.showinfo('請選擇草稿','請在清單選擇一筆待校對 AI 草稿。',parent=self);return
+        ident=self.rows[int(selected[0])][0]
+        try:item=batch.review_item(self.db,self.job,ident)
+        except Exception as e:messagebox.showerror('無法審核',str(e),parent=self);return
+        w=tk.Toplevel(self);w.title('核對 AI 草稿與來源');w.geometry('1040x720');w.transient(self)
+        tk.Label(w,text='核對後才加入搜尋',font=('Microsoft JhengHei',15,'bold')).pack(anchor='w',padx=16,pady=8)
+        tk.Label(w,text='左側為原始索引片段，右側為 AI 草稿；請核對機型、步驟和限制，可編輯右側內容。',anchor='w').pack(fill='x',padx=16)
+        title=tk.StringVar(value=(item['name']+' — '+item['locator'])[:150]);tk.Entry(w,textvariable=title,font=('Microsoft JhengHei',11)).pack(fill='x',padx=16,pady=8)
+        pane=tk.PanedWindow(w,orient='horizontal');pane.pack(fill='both',expand=True,padx=16,pady=6)
+        left=tk.Text(pane,wrap='word',font=('Microsoft JhengHei',10));right=tk.Text(pane,wrap='word',font=('Microsoft JhengHei',10));pane.add(left);pane.add(right)
+        left.insert('1.0',item['name']+'\n'+item['locator']+'\n\n'+item['excerpt']);left.configure(state='disabled');right.insert('1.0',item['draft'])
+        def publish():
+            if not messagebox.askyesno('確認已核對','確認已將內容與來源比對？知識卡會加入搜尋，並標示為 AI 整理、使用者校對。',parent=w):return
+            try:batch.publish_review(self.db,self.job,ident,title.get(),right.get('1.0','end-1c'));w.destroy();self.refresh()
+            except Exception as e:messagebox.showerror('無法加入搜尋',str(e),parent=w)
+        controls=tk.Frame(w);controls.pack(fill='x',padx=16,pady=10)
+        def open_original():
+            try:
+                batch.review_item(self.db,self.job,ident)
+                os.startfile(item['path'])
+            except Exception as e:messagebox.showerror('無法開啟來源',str(e),parent=w)
+        tk.Button(controls,text='開啟原始文件',command=open_original).pack(side='left')
+        tk.Button(controls,text='確認已核對並加入搜尋',command=publish).pack(side='right')
     def poll(self):
         try:
             while True:

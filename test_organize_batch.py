@@ -86,6 +86,49 @@ class TestBatch(unittest.TestCase):
   with patch.object(b.ai_service,'answer',return_value=('草稿 [1]',[{'id':1}],{})) as answer:b.run(self.db,job)
   self.assertEqual(answer.call_args.args[6],200);self.assertEqual(b.stats(self.db,job)['counts']['review'],1)
 
+ def test_review_publishes_searchable_card_and_tracks_original(self):
+  import ai_service
+  job=b.create(self.db,self.cfg,100000)
+  with patch.object(b.ai_service,'answer',return_value=('BOOX 前光在控制中心調整 [1]',[{'id':1}],{})):b.run(self.db,job)
+  db=b.connect(self.db);item=db.execute("SELECT id FROM organize_items WHERE job_id=? AND state='review'",(job,)).fetchone()[0];db.close()
+  card=b.publish_review(self.db,job,item,'BOOX 前光操作','BOOX 前光在控制中心調整。')
+  self.assertTrue(Path(card).is_file());self.assertEqual(b.stats(self.db,job)['counts']['published'],1)
+  with self.assertRaises(ValueError):b.publish_review(self.db,job,item,'BOOX 前光操作','BOOX 前光在控制中心調整。')
+  refs=ai_service.retrieve(str(self.db),'BOOX 前光')
+  cards=[x for x in refs if x['path']==card];self.assertTrue(cards,refs)
+  self.assertEqual(cards[0]['origin']['path'],str(self.doc.resolve()));self.assertIn('控制中心',cards[0]['origin']['excerpt'])
+  self.doc.write_text('# 前光\n新的不同內容。',encoding='utf8')
+  self.assertTrue(ai_service.source_state(cards[0]))
+  self.assertFalse(any(x['path']==card for x in ai_service.retrieve(str(self.db),'BOOX 前光')))
+  self.doc.write_bytes(self.before)
+
+ def test_multi_document_cards_retrieval_and_ai_citations(self):
+  import ai_service
+  other=self.src/'other.md';other.write_text('# 前光\n開啟前光後拖動亮度滑桿。',encoding='utf8')
+  core.scan(str(self.src),str(self.db));job=b.create(self.db,self.cfg,100000)
+  with patch.object(b.ai_service,'answer',return_value=('根據手冊調整前光 [1]',[{'id':1}],{})):b.run(self.db,job)
+  db=b.connect(self.db)
+  try:rows=db.execute("SELECT id,path FROM organize_items WHERE job_id=? AND state='review' ORDER BY id",(job,)).fetchall()
+  finally:db.close()
+  self.assertEqual(len(rows),2)
+  card_paths=[]
+  for item,source in rows:
+   card_paths.append(b.publish_review(self.db,job,item,'前光調整 '+Path(source).stem,'前光調整：進入控制中心或拖動亮度滑桿。'))
+  refs=[x for x in ai_service.retrieve(str(self.db),'前光調整') if x['path'] in card_paths]
+  self.assertEqual(len(refs),2);self.assertEqual({x['origin']['path'] for x in refs},{str(self.doc.resolve()),str(other.resolve())})
+  for i,x in enumerate(refs,1):x['id']=i
+  def fake(url,headers,payload):return {'output':[{'type':'message','content':[{'type':'output_text','text':'控制中心調整 [1]；滑桿調整 [2]'}]}]}
+  result,chosen,_=ai_service.answer('怎麼調整前光？',refs,'openai','fake','fake',post=fake,network_enabled=True)
+  self.assertIn('[1]',result);self.assertIn('[2]',result);self.assertEqual({x['origin']['path'] for x in chosen},{str(self.doc.resolve()),str(other.resolve())})
+
+ def test_source_changes_before_approval_are_rejected(self):
+  job=b.create(self.db,self.cfg,100000)
+  with patch.object(b.ai_service,'answer',return_value=('草稿 [1]',[{'id':1}],{})):b.run(self.db,job)
+  db=b.connect(self.db);item=db.execute('SELECT id FROM organize_items WHERE job_id=?',(job,)).fetchone()[0];db.close()
+  self.doc.write_text('已變更的內容',encoding='utf8')
+  with self.assertRaises(ValueError):b.publish_review(self.db,job,item,'標題','內容')
+  self.doc.write_bytes(self.before)
+
  def test_pause_resume_and_review(self):
   job=b.create(self.db,self.cfg,100000);b.run(self.db,job,lambda:True);self.assertEqual(b.stats(self.db,job)['counts']['pending'],1)
   with patch.object(b.ai_service,'answer',return_value=('整理 [1]',[{'id':1}],{})) as answer:b.run(self.db,job);self.assertEqual(answer.call_count,1)

@@ -64,6 +64,9 @@ def source_state(source):
     """Check source metadata without opening or hydrating its contents."""
     if source.get('kind')==web_search.KIND:
         return '' if source.get('url')==source.get('path') and web_search.safe_public_url(source.get('url')) else '網路來源網址無效'
+    if source.get('origin'):
+        failure=source_state(source['origin'])
+        if failure:return '原始來源：'+failure
     try:
         st=os.stat(source['path'],follow_symlinks=False); attrs=getattr(st,'st_file_attributes',0)
         if stat.S_ISLNK(st.st_mode) or attrs & core.REPARSE: return '連結或重新解析點，請重新掃描來源'
@@ -108,7 +111,7 @@ def retrieve(db_path, question):
     brand_sql=' AND ('+' OR '.join('(lower(d.path) LIKE ? OR lower(c.text) LIKE ?)' for _ in brands)+')' if brands else ''
     brand_args=[v for b in brands for v in ('%'+b+'%','%'+b+'%')]
     filename_terms=[t.lower() for t in tokens if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',t) and len(t)>=3 and t.lower() not in GENERIC_FILENAME_TERMS][:8]
-    db=sqlite3.connect(db_path); scores={}; items={}; matched={}; filename_matches=set()
+    db=sqlite3.connect(db_path); scores={}; items={}; matched={}; filename_matches=set(); provenance={}
     try:
         for token in tokens:
             if len(token)>=3:
@@ -162,6 +165,9 @@ def retrieve(db_path, question):
                     items[new_ident]=neighbour
                     scores[new_ident]=max(scores.get(new_ident,0),scores[ident]+(0.25 if action else 0.01))
                     matched.setdefault(new_ident,set()).update(matched.get(ident,set()))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='organize_card_sources'").fetchone():
+            for cp,csha,source_sha,loc,excerpt,orig_path,orig_sha,orig_status,orig_size,orig_mtime,approved_sha in db.execute("SELECT card.path,card.sha256,p.source_sha,p.locator,p.excerpt,src.path,src.sha256,src.status,src.size,src.mtime_ns,p.approved_sha FROM organize_card_sources p JOIN documents card ON card.id=p.card_document_id LEFT JOIN documents src ON src.id=p.source_document_id"):
+                provenance[cp]={'valid':bool(orig_path and orig_status=='indexed' and source_sha==orig_sha and csha==approved_sha),'path':orig_path,'sha256':orig_sha,'locator':loc,'excerpt':excerpt,'size':orig_size,'mtime_ns':orig_mtime,'kind':'原始來源'}
     finally: db.close()
     def quality(ident):
         row=items[ident]; path=row[1].lower(); locator=row[4].lower(); value=scores[ident]
@@ -178,6 +184,8 @@ def retrieve(db_path, question):
     for ident in sorted(scores,key=quality,reverse=True):
         row=items[ident]; _,path,status,sha,locator,text,mtime,detail=row[:8]
         if source_state({'path':path,'mtime_ns':mtime,'size':row[-1]}): continue
+        origin=provenance.get(path)
+        if origin and (not origin['valid'] or source_state(origin)): continue
         if 'prompt' in Path(path).name.lower() or '提示詞' in Path(path).name: continue
         evidence=(Path(path).stem+' '+text).lower()
         if model_scope and not all(re.search(r'(?<![a-z0-9])'+re.escape(term)+r'(?![a-z0-9])',evidence) for term in model_scope): continue
@@ -209,7 +217,8 @@ def retrieve(db_path, question):
         excerpt=excerpt[:remaining]; total+=len(excerpt); per_doc[path]=per_doc.get(path,0)+1
         if duplicate: seen_chunks.add(duplicate)
         kind=({'ocr':'PDF OCR 衍生文字（使用者校對，可能有誤）','table':'PDF 表格擷取（使用者校對，可能有誤）','scanned_table':'PDF 掃描表格 OCR（使用者校對，欄位可能錯置）'}.get(row[8],'PDF 衍生內容（可能有誤）')) if len(row)>9 else detail if detail in core.AI_REVIEW_STATES else '使用者知識卡' if detail=='使用者知識卡；非原始文件' else '來源文件（部分頁面擷取失敗）' if '擷取失敗' in detail else '來源文件（來源可信度未確認）'
-        result.append({'id':len(result)+1,'path':path,'locator':locator,'excerpt':excerpt,'sha256':sha,'mtime_ns':mtime,'size':row[-1],'kind':kind})
+        if origin: kind='AI 整理知識卡（使用者已校對；請核對原始來源）'
+        result.append({'id':len(result)+1,'path':path,'locator':locator,'excerpt':excerpt,'sha256':sha,'mtime_ns':mtime,'size':row[-1],'kind':kind,**({'origin':origin} if origin else {})})
         if len(result)>=MAX_SOURCES: break
     model_tokens=model_identifiers(question)
     if model_tokens:

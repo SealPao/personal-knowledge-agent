@@ -60,6 +60,7 @@ def connect(path):
       UNIQUE(document_id,source_sha256,page,language));
     CREATE TABLE IF NOT EXISTS device_captures(id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL REFERENCES documents(id),
       png BLOB NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS organize_card_sources(card_document_id INTEGER PRIMARY KEY, source_document_id INTEGER NOT NULL, source_sha TEXT NOT NULL, locator TEXT NOT NULL, excerpt TEXT NOT NULL, item_id INTEGER NOT NULL UNIQUE, approved_sha TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS ai_card_reviews(id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL REFERENCES documents(id),
       content_sha256 TEXT NOT NULL, previous_detail TEXT NOT NULL, new_detail TEXT NOT NULL, reviewed_at TEXT NOT NULL);
     ''')
@@ -467,7 +468,7 @@ def retry_import_copy(db_path,target,source_label):
         return str(target),True
     finally: db.close()
 
-def save_card(db_path, title, content, existing=None):
+def save_card(db_path, title, content, existing=None, new_id=None):
     """Save a user-edited card outside the source and index it as a separate document."""
     title=title.strip(); content=content.strip()
     if not title or '\n' in title or len(title)>160: raise ValueError('請輸入 160 字以內的單行標題')
@@ -488,16 +489,23 @@ def save_card(db_path, title, content, existing=None):
             if path.is_symlink() or not path.is_file() or getattr(os.stat(path,follow_symlinks=False),'st_file_attributes',0) & REPARSE: raise ValueError('知識卡不存在或不可編輯')
             prior=db.execute('SELECT detail FROM documents WHERE path=?',(str(path),)).fetchone()
             if prior and prior[0] in AI_REVIEW_STATES: detail=AI_REVIEW_STATES[prior[0]][0]
-        else: path=cards/(uuid.uuid4().hex+'.md')
+        else:
+            if new_id is not None and not re.fullmatch(r'[0-9a-f]{32}',str(new_id)): raise ValueError('知識卡識別碼無效')
+            path=cards/((new_id or uuid.uuid4().hex)+'.md')
         data=('# '+title+'\n\n'+content+'\n').encode('utf-8')
         temp=cards/(uuid.uuid4().hex+'.tmp')
         try:
-            with open(temp,'xb') as f: f.write(data); f.flush(); os.fsync(f.fileno())
-            os.replace(temp,path)
+            if new_id is not None and not existing and os.path.lexists(path):
+                if path.is_symlink() or not path.is_file() or getattr(os.stat(path,follow_symlinks=False),'st_file_attributes',0)&REPARSE: raise ValueError('既有知識卡無法安全讀取')
+                if path.read_bytes()!=data: raise ValueError('此整理項目的知識卡已存在且內容不同；請在文件管理編輯。')
+            else:
+                with open(temp,'xb') as f: f.write(data); f.flush(); os.fsync(f.fileno())
+                if new_id is not None and not existing: _publish_import_temp(temp,path)
+                else: os.replace(temp,path)
         finally:
             if temp.exists(): temp.unlink()
         st=path.stat(); chunks,_=parse(path,data)
-        _record(db,str(path),'.md',st.st_size,st.st_mtime_ns,hashlib.sha256(data).hexdigest(),'indexed',detail,chunks)
+        _record(db,str(path),'.md',st.st_size,st.st_mtime_ns,hashlib.sha256(data).hexdigest(),'pending_review' if new_id is not None and not existing else 'indexed','AI 整理卡（發布待完成）' if new_id is not None and not existing else detail,chunks)
         if existing and prior and prior[0] in AI_REVIEW_STATES and prior[0]!=detail:
             row=db.execute('SELECT id FROM documents WHERE path=?',(str(path),)).fetchone()
             with db: db.execute("INSERT INTO ai_card_reviews(document_id,content_sha256,previous_detail,new_detail,reviewed_at) VALUES(?,?,?,?,datetime('now','localtime'))",(row[0],hashlib.sha256(data).hexdigest(),prior[0],detail))

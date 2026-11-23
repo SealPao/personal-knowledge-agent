@@ -1,5 +1,5 @@
 """Resumable document preparation; source files remain read-only."""
-import json, sqlite3, uuid
+import json, sqlite3, uuid, hashlib
 from pathlib import Path
 import core, ai_service, ai_ui, budget, pdf_features, ocr_batch, workspace
 
@@ -9,6 +9,7 @@ def connect(path):
     db=core.connect(str(path))
     db.executescript('''CREATE TABLE IF NOT EXISTS organize_jobs(id TEXT PRIMARY KEY, config TEXT NOT NULL, token_limit INTEGER NOT NULL, reserved INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS organize_items(id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES organize_jobs(id), document_id INTEGER NOT NULL, path TEXT NOT NULL, sha TEXT, size INTEGER, mtime INTEGER, locator TEXT NOT NULL, text TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, result TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', reserved INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS organize_card_sources(card_document_id INTEGER PRIMARY KEY, source_document_id INTEGER NOT NULL, source_sha TEXT NOT NULL, locator TEXT NOT NULL, excerpt TEXT NOT NULL, item_id INTEGER NOT NULL UNIQUE, approved_sha TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS organize_pending_lookup ON organize_items(job_id,state,document_id,id);''')
     return db
 
@@ -105,6 +106,38 @@ def compact_pending_text(db,job):
 
 def compact_pending_csv(db,job):
     return compact_pending_text(db,job)
+
+def review_item(path,job,item_id):
+    db=connect(path)
+    try:
+        row=db.execute('SELECT path,sha,size,mtime,locator,text,kind,state,result FROM organize_items WHERE id=? AND job_id=?',(item_id,job)).fetchone()
+        if not row or row[7]!='review' or row[6]=='ocr': raise ValueError('請選擇待校對的 AI 文字草稿。')
+        name,sha,size,mtime,loc,excerpt,kind,state,result=row
+        doc=db.execute('SELECT id,sha256,status FROM documents WHERE path=?',(name,)).fetchone()
+        if not doc or doc[1]!=sha or doc[2]!='indexed' or ai_service.source_state({'path':name,'size':size,'mtime_ns':mtime}): raise ValueError('來源已變更或無法存取，請重新掃描。')
+        return {'name':Path(name).name,'path':name,'sha':sha,'locator':loc,'excerpt':excerpt,'draft':result}
+    finally:db.close()
+
+def publish_review(path,job,item_id,title,body):
+    row=review_item(path,job,item_id)
+    if not body.strip():raise ValueError('請輸入已核對的內容。')
+    # Stable ID permits safe recovery after a crash without duplicate cards.
+    card_id=hashlib.sha256(('organize-review:'+job+':'+str(item_id)).encode()).hexdigest()[:32]
+    content='（AI 草稿經使用者校對；原始來源需依版本核對）\n\n'+body.strip()
+    card_path=core.save_card(path,title,content,new_id=card_id)
+    db=connect(path)
+    try:
+        with db:
+            current=db.execute('SELECT document_id,sha,state FROM organize_items WHERE id=? AND job_id=?',(item_id,job)).fetchone()
+            source=db.execute('SELECT sha256,status,path,size,mtime_ns FROM documents WHERE id=?',(current[0],)).fetchone() if current else None
+            if not current or current[2]!='review' or not source or source[0]!=row['sha'] or source[1]!='indexed' or ai_service.source_state({'path':source[2],'size':source[3],'mtime_ns':source[4]}):raise ValueError('來源或工作項目在儲存期間變更；未發布引用。')
+            card=db.execute('SELECT id,sha256 FROM documents WHERE path=?',(card_path,)).fetchone()
+            if not card:raise ValueError('知識卡索引不存在。')
+            db.execute('INSERT INTO organize_card_sources(card_document_id,source_document_id,source_sha,locator,excerpt,item_id,approved_sha) VALUES(?,?,?,?,?,?,?)',(card[0],current[0],row['sha'],row['locator'],row['excerpt'],item_id,card[1]))
+            db.execute("UPDATE documents SET status='indexed',detail='AI 整理知識卡（使用者已校對）' WHERE id=?",(card[0],))
+            db.execute("UPDATE organize_items SET state='published',detail='使用者已核對並建立可搜尋知識卡。' WHERE id=? AND state='review'",(item_id,))
+        return card_path
+    finally:db.close()
 
 def skip_unknown(path,job):
     db=connect(path)
