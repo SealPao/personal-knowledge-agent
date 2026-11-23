@@ -563,6 +563,10 @@ def _claim_warning(body,quotes):
             warnings.append('按鍵操作可能與引用原文相反')
     return warnings
 
+class IncompleteResponse(RuntimeError):
+    def __init__(self,message,usage):
+        super().__init__(message); self.usage=usage if isinstance(usage,dict) else {}
+
 class EvidenceError(RuntimeError):
     """A model answer could not be tied to exact source text."""
 
@@ -625,7 +629,7 @@ def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434
         response=post('https://api.openai.com/v1/responses',{'Authorization':'Bearer '+key,'Content-Type':'application/json'},payload)
         parts=[p.get('text','') for item in response.get('output',[]) if item.get('type')=='message' for p in item.get('content',[]) if p.get('type')=='output_text']
         text='\n'.join(parts).strip(); usage=response.get('usage',{})
-        if response.get('status')=='incomplete': raise RuntimeError('模型回覆未完成；請提高輸出上限或縮短問題')
+        if response.get('status')=='incomplete': raise IncompleteResponse('模型回覆未完成；請提高輸出上限或縮短問題',usage)
     elif provider=='local':
         if model==local_ai.MODEL and not local_ai.headers_for(local_endpoint(base)):
             raise RuntimeError('內建本地 AI 尚未啟動，請先按「啟動內建本地 AI」。')

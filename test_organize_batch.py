@@ -51,6 +51,29 @@ class TestBatch(unittest.TestCase):
   with patch.object(b.ai_service,'answer',side_effect=answer):b.run(self.db,job,lambda:len(names)>=3)
   self.assertEqual(len(set(names)),3)
 
+ def test_prompt_documents_are_separate_and_not_sent(self):
+  prompt=self.src/'Prompt 提示詞.txt';prompt.write_text('這是一份提示詞。',encoding='utf8');core.scan(str(self.src),str(self.db));job=b.create(self.db,self.cfg,100000)
+  db=b.connect(self.db)
+  try:row=db.execute('SELECT state,kind FROM organize_items WHERE job_id=? AND path=?',(job,str(prompt.resolve()))).fetchone()
+  finally:db.close()
+  self.assertEqual(row,('skipped','prompt'))
+
+ def test_skip_unknown_preserves_reservation(self):
+  job=b.create(self.db,self.cfg,100000);db=b.connect(self.db)
+  with db:
+   db.execute("UPDATE organize_jobs SET reserved=6000 WHERE id=?",(job,))
+   db.execute("UPDATE organize_items SET state='unknown',detail='未確認' WHERE job_id=?",(job,))
+  db.close();self.assertEqual(b.skip_unknown(self.db,job),1)
+  self.assertEqual(b.stats(self.db,job)['reserved'],6000);self.assertEqual(b.stats(self.db,job)['counts']['skipped'],1)
+
+ def test_incomplete_answer_accounts_reported_usage(self):
+  config={**self.cfg,'provider':'openai','network_enabled':True};ai_ui.write_config(self.db.parent/'ai-settings.json',config)
+  with patch.object(b.ai_service,'load_key',return_value='fake'):
+   job=b.create(self.db,config,100000)
+   error=b.ai_service.IncompleteResponse('未完成',{'input_tokens':100,'output_tokens':20})
+   with patch.object(b.budget,'reserve',return_value='ticket'),patch.object(b.budget,'finish') as finish,patch.object(b.budget,'uncertain') as uncertain,patch.object(b.ai_service,'answer',side_effect=error):b.run(self.db,job)
+  finish.assert_called_once_with(self.db,'ticket',error.usage);uncertain.assert_not_called();self.assertEqual(b.stats(self.db,job)['counts']['failed'],1)
+
  def test_pause_resume_and_review(self):
   job=b.create(self.db,self.cfg,100000);b.run(self.db,job,lambda:True);self.assertEqual(b.stats(self.db,job)['counts']['pending'],1)
   with patch.object(b.ai_service,'answer',return_value=('整理 [1]',[{'id':1}],{})) as answer:b.run(self.db,job);self.assertEqual(answer.call_count,1)

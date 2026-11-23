@@ -75,7 +75,9 @@ class OrganizeWindow(tk.Toplevel):
                 self.events.put(('preview',report))
             except Exception as e:
                 if ticket:
-                    try:budget.uncertain(self.db,ticket)
+                    try:
+                        if isinstance(e,ai_service.IncompleteResponse):budget.finish(self.db,ticket,e.usage)
+                        else:budget.uncertain(self.db,ticket)
                     except Exception:pass
                 self.events.put(('error',str(e)))
         threading.Thread(target=work,daemon=True).start()

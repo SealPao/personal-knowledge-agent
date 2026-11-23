@@ -26,6 +26,10 @@ def pack_csv_chunks(chunks,limit=3000):
     if parts:grouped.append((first if first==last else first+' 至 '+last,'\n'.join(parts)))
     return grouped
 
+def is_prompt(path):
+    name=Path(path).name.lower()
+    return 'prompt' in name or '提示詞' in name or '提示词' in name
+
 def create(path,config,limit):
     limit=int(limit)
     if limit<1000 or limit>100000000: raise ValueError('整個工作 Token 上限須介於 1,000 與 100,000,000。')
@@ -42,6 +46,9 @@ def create(path,config,limit):
         with db:
             db.execute("INSERT INTO organize_jobs(id,config,token_limit,state) VALUES(?,?,?,'paused')",(ident,json.dumps(config,ensure_ascii=False),limit))
             for did,name,sha,size,mtime,status,ext,detail in rows:
+                if is_prompt(name):
+                    db.execute("INSERT INTO organize_items(job_id,document_id,path,sha,size,mtime,locator,text,kind,state,detail) VALUES(?,?,?,?,?,?,?,?,?,'skipped',?)",(ident,did,name,sha,size,mtime,'整份文件','','prompt','提示詞與一般知識分開，未送 AI 整理。'))
+                    continue
                 chunks=db.execute('SELECT locator,text FROM chunks WHERE document_id=? ORDER BY id',(did,)).fetchall() if status=='indexed' else []
                 if chunks:
                     chunks=pack_csv_chunks(chunks)
@@ -99,6 +106,16 @@ def compact_pending_text(db,job):
 def compact_pending_csv(db,job):
     return compact_pending_text(db,job)
 
+def skip_unknown(path,job):
+    db=connect(path)
+    try:
+        with db:
+            row=db.execute('SELECT state FROM organize_jobs WHERE id=?',(job,)).fetchone()
+            if not row or row[0]=='running': raise ValueError('工作正在執行或不存在。')
+            count=db.execute("UPDATE organize_items SET state='skipped',detail=detail || '；使用者選擇略過，費用預留仍保留。' WHERE job_id=? AND state='unknown'",(job,)).rowcount
+            return count
+    finally: db.close()
+
 def retry_failed(path,job):
     db=connect(path)
     try:
@@ -128,6 +145,8 @@ def run(path,job,cancelled=lambda:False,progress=lambda x:None):
         config=json.loads(row[0]);limit=row[1]
         if ai_ui.read_config(Path(path).parent/'ai-settings.json')!=config: raise ValueError('AI 設定已變更；請建立新工作，避免混用模型。')
         if db.execute("SELECT count(*) FROM organize_items WHERE job_id=? AND state='unknown'",(job,)).fetchone()[0]: raise ValueError('有中斷後用量未知的項目；請先人工檢查，不能自動重試。')
+        prompt_rows=db.execute("SELECT id,path FROM organize_items WHERE job_id=? AND state='pending'",(job,)).fetchall()
+        db.executemany("UPDATE organize_items SET state='skipped',detail='提示詞與一般知識分開，未送 AI 整理。' WHERE id=?",[(ident,) for ident,path in prompt_rows if is_prompt(path)])
         progress('正在整理既有佇列，保留已完成草稿…')
         compact_pending_text(db,job)
         db.execute("UPDATE organize_jobs SET state='running' WHERE id=?",(job,));db.commit()
@@ -178,7 +197,9 @@ def run(path,job,cancelled=lambda:False,progress=lambda x:None):
                 with db: db.execute("UPDATE organize_items SET state='review',result=?,detail='AI 草稿；尚未人工核對，未加入搜尋。' WHERE id=?",(text,ident))
             except Exception as e:
                 if ticket:
-                    try: budget.uncertain(path,ticket)
+                    try:
+                        if isinstance(e,ai_service.IncompleteResponse): budget.finish(path,ticket,e.usage);ticket=None
+                        else: budget.uncertain(path,ticket)
                     except Exception: pass
                 with db: db.execute("UPDATE organize_items SET state=?,detail=? WHERE id=?",('unknown' if ticket else 'failed',str(e)[:500],ident))
                 break

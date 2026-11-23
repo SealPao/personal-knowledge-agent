@@ -18,6 +18,7 @@ class OrganizeBatchWindow(tk.Toplevel):
         self.resume=tk.Button(bar,text='繼續上次工作',command=self.begin);self.resume.pack(side='left',padx=4)
         tk.Button(bar,text='暫停',command=self.cancel.set).pack(side='left',padx=4)
         tk.Button(bar,text='重試失敗項目',command=self.retry).pack(side='left',padx=4)
+        tk.Button(bar,text='略過未知項目',command=self.skip_unknown).pack(side='left',padx=4)
         self.progress=ttk.Progressbar(self,maximum=100);self.progress.pack(fill='x',padx=20,pady=5)
         self.status=tk.StringVar();tk.Label(self,textvariable=self.status,justify='left',anchor='w',wraplength=940).pack(fill='x',padx=20,pady=5)
         tk.Label(self,textvariable=self.current,justify='left',anchor='w',wraplength=940).pack(fill='x',padx=20)
@@ -33,6 +34,12 @@ class OrganizeBatchWindow(tk.Toplevel):
         if config['provider']=='openai' and not messagebox.askyesno('開始雲端整理','將逐段把文件內容傳送至 OpenAI，可能產生費用。Token 為保守預留，不等於官方用量。確定開始？',parent=self):return
         try:self.job=batch.create(self.db,config,self.limit.get());self.begin()
         except Exception as e:messagebox.showerror('無法開始',str(e),parent=self)
+    def skip_unknown(self):
+        if self.busy or not self.job:return
+        if not messagebox.askyesno('略過未知項目','未知項目的實際費用可能尚未確認。略過後不會重送，也不會刪除費用預留；可繼續其他文件。確定略過？',parent=self):return
+        try:
+            count=batch.skip_unknown(self.db,self.job);self.refresh();messagebox.showinfo('處理完成',f'已略過 {count} 個未知項目；費用預留仍保留。',parent=self)
+        except Exception as e:messagebox.showerror('無法略過',str(e),parent=self)
     def retry(self):
         if self.busy or not self.job:return
         try:batch.retry_failed(self.db,self.job);self.refresh()
@@ -52,7 +59,7 @@ class OrganizeBatchWindow(tk.Toplevel):
         info=batch.stats(self.db,self.job);counts=info['counts'];self.progress['value']=100*info['processed']/max(info['documents'],1)
         self.status.set(f"文件已處理 {info['processed']} / {info['documents']}；待執行片段 {counts.get('pending',0)}，待校對 {counts.get('review',0)}，失敗 {counts.get('failed',0)}，略過 {counts.get('skipped',0)}，狀態未知 {counts.get('unknown',0)}。\nToken 保守預留 {info['reserved']} / {info['limit']}；這不是官方實際用量。完成比例包含待校對及失敗文件。")
         db=batch.connect(self.db)
-        try:self.rows=db.execute("SELECT path,locator,state,result,detail FROM organize_items WHERE job_id=? ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'pending' THEN 1 WHEN 'failed' THEN 2 WHEN 'review' THEN 3 ELSE 4 END,id LIMIT 300",(self.job,)).fetchall()
+        try:self.rows=db.execute("SELECT path,locator,state,result,detail FROM organize_items WHERE job_id=? ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'unknown' THEN 1 WHEN 'failed' THEN 2 WHEN 'pending' THEN 3 WHEN 'review' THEN 4 ELSE 5 END,id LIMIT 300",(self.job,)).fetchall()
         finally:db.close()
         self.tree.delete(*self.tree.get_children())
         states={'pending':'待處理','running':'處理中','review':'待校對','failed':'失敗','skipped':'略過','unknown':'中斷待檢查'}
