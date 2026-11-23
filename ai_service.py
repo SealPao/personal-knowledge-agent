@@ -72,6 +72,19 @@ def source_state(source):
     except (OSError,KeyError,TypeError): return '來源無法存取或資料不完整'
     return ''
 
+def _question_topics(question):
+    """Recognize narrow topics only when explicitly mentioned; preserve general search otherwise."""
+    q=question.lower(); groups=[]
+    if any(term in q for term in ('前光','frontlight','front light')): groups.append(('前光','frontlight','front light'))
+    if any(term in q for term in ('刷新','refresh','重繪','重绘')): groups.append(('刷新','refresh','重繪','重绘'))
+    return groups
+
+
+def _matches_question_topic(question,text):
+    groups=_question_topics(question)
+    return not groups or any(any(term in text.lower() for term in group) for group in groups)
+
+
 def retrieve(db_path, question):
     question=question.strip()
     if not question or len(question)>MAX_QUESTION: raise ValueError('請輸入不超過 2000 字的問題')
@@ -126,6 +139,26 @@ def retrieve(db_path, question):
                     FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.id=? ORDER BY c.id LIMIT 2''',(docid,)).fetchall()
                 for row in rows:
                     ident=('original',row[0]); items[ident]=row; scores[ident]=scores.get(ident,0)+0.05; matched.setdefault(ident,set()).add(term)
+        # HTML and Markdown indexing may split one section into many short blocks.
+        # Include a bounded number of following blocks only within the same heading.
+        if _question_topics(question):
+            topic_seeds=[ident for ident in scores if ident[0]=='original' and _matches_question_topic(question,items[ident][4])]
+            seeds=sorted(topic_seeds,key=lambda ident:scores[ident],reverse=True)[:40]
+            for ident in seeds:
+                if ident[0]!='original': continue
+                row=items[ident]; path=row[1]; locator=row[4]
+                if Path(path).suffix.lower() not in ('.html','.htm','.md'): continue
+                section=locator.split('，',1)[0].strip()
+                if not section or not _matches_question_topic(question,section): continue
+                neighbours=db.execute('''SELECT c.id,d.path,d.status,d.sha256,c.locator,c.text,d.mtime_ns,d.detail,d.size
+                    FROM chunks c JOIN documents d ON d.id=c.document_id
+                    WHERE d.path=? AND c.id>? AND d.status='indexed' ORDER BY c.id LIMIT 5''',(path,row[0])).fetchall()
+                for neighbour in neighbours:
+                    if neighbour[4].split('，',1)[0].strip()!=section: break
+                    new_ident=('original',neighbour[0]); action=any(word in neighbour[5] for word in ('選擇','點選','點擊','滑動','下滑','拖動','控制中心','滑桿','開啟','進入'))
+                    items[new_ident]=neighbour
+                    scores[new_ident]=max(scores.get(new_ident,0),scores[ident]+(0.25 if action else 0.01))
+                    matched.setdefault(new_ident,set()).update(matched.get(ident,set()))
     finally: db.close()
     def quality(ident):
         row=items[ident]; path=row[1].lower(); locator=row[4].lower(); value=scores[ident]
@@ -149,6 +182,7 @@ def retrieve(db_path, question):
         nonbrand=[t.lower() for t in tokens if t.lower() not in brands and t.lower() not in filename_matches]
         if brands and nonbrand and not any(t in (text+' '+locator).lower() for t in nonbrand): continue
         if nonbrand and not any(t in (text+' '+locator).lower() for t in nonbrand): continue
+        if not _matches_question_topic(question,text+' '+locator): continue
         if per_doc.get(path,0)>=2: continue
         name=re.sub(r'^[0-9a-f]{32}--','',Path(path).name.lower())
         duplicate=(sha,name,locator,ident[0],hashlib.sha256(text.encode('utf-8')).digest()) if sha else None
@@ -188,9 +222,8 @@ def retrieve_with_general_fallback(db_path,question):
     if exact or not models or len(brands)!=1: return exact
     generic_question=question
     for model in models:
-        parts=re.findall(r'[a-z]+|[0-9]+',model.lower())
-        pattern=r'(?<![a-z0-9])'+r'[\s_-]*'.join(re.escape(part) for part in parts)+r'(?![a-z0-9])'
-        generic_question=re.sub(pattern,' ',generic_question,flags=re.I)
+        pattern=_model_pattern(model)
+        if pattern: generic_question=re.sub(pattern,' ',generic_question,flags=re.I)
     generic_question=generic_question.replace('補充品牌或機型：',' ')
     generic=retrieve(db_path,generic_question)
     safe=[]
@@ -205,15 +238,21 @@ def retrieve_with_general_fallback(db_path,question):
     return safe
 
 
+def _model_pattern(term):
+    parts=re.findall(r'[a-z]+|[0-9]+(?:\.[0-9]+)?',term.lower())
+    if not parts: return ''
+    return r'(?<![a-z0-9])'+r'[\s_-]*'.join(re.escape(part) for part in parts)+r'(?![a-z0-9]|\.[0-9])'
+
+
 def matches_model(text,term):
-    parts=re.findall(r'[a-z]+|[0-9]+',term.lower())
-    if not parts: return False
-    pattern=r'(?<![a-z0-9])'+r'[\s_-]*'.join(re.escape(part) for part in parts)+r'(?![a-z0-9])'
-    return bool(re.search(pattern,text.lower()))
+    pattern=_model_pattern(term)
+    return bool(pattern and re.search(pattern,text.lower()))
+
 
 def model_identifiers(question):
-    pattern=r'(?<![a-zA-Z0-9-])[a-zA-Z][a-zA-Z0-9-]*\s*\d[a-zA-Z0-9-]*(?![a-zA-Z0-9])'
+    pattern=r'(?<![a-zA-Z0-9-])[a-zA-Z][a-zA-Z0-9-]*\s*\d+(?:\.\d+)?[a-zA-Z0-9-]*(?![a-zA-Z0-9])'
     return [t.strip().lower() for t in re.findall(pattern,question) if len(re.sub(r'[^a-z0-9]','',t.lower()))>=3 and not re.sub(r'[^a-z0-9]','',t.lower()).startswith(('wifi','usb','hdmi','android','bluetooth'))]
+
 
 def select_web_results(question,results):
     """Prefer exact model snippets; otherwise retain explicitly labelled brand-general results."""
@@ -424,6 +463,87 @@ def _web_unsupported_terms(body,quotes):
     return [term for term in dict.fromkeys(terms) if not re.search(r'(?<![a-z0-9])'+re.escape(term.lower())+r'(?![a-z0-9])',evidence)]
 
 
+def _looks_like_title(body,sources,question=""):
+    """Reject file names, product listings and unanswered headings, not instructions."""
+    text=body.strip()
+    if re.search(r'\.(?:md|html?|pdf|txt|docx|xlsx)(?:\s|$)',text,re.I): return True
+    if any(tag in text for tag in ('【新機上市】','【新機上架】','[新品]')) or re.match(r'^\s*#{1,6}\s',text): return True
+    if re.search(r'(?:現貨|預購|缺貨)\s*[\]】]?',text) and not re.search(r'開啟|點選|選擇|調整|按下|長按|短按|輸入',text): return True
+    if re.search(r'[?？]\s*$',text): return True
+    def key(value): return re.sub(r'[^a-z0-9\u3400-\u9fff]','',value.lower())
+    candidate=key(text); prompt=key(question)
+    if len(candidate)>=8 and len(prompt)>=8 and difflib.SequenceMatcher(None,candidate,prompt,autojunk=False).ratio()>=.9: return True
+    for source in sources:
+        name=source.get('title') or Path(source.get('path','')).stem
+        reference=key(name)
+        if len(candidate)>=12 and len(reference)>=12 and difflib.SequenceMatcher(None,candidate,reference,autojunk=False).ratio()>=.9: return True
+    return False
+
+
+def extract_relevant_steps(question,sources):
+    """Conservative verbatim fallback for explicit frontlight or refresh questions."""
+    topics=_question_topics(question)
+    pdf=bool(re.search(r'pdf',question,re.I) and re.search(r'字體|字体|字號|字号|放大|縮放|缩放|排版',question))
+    if not topics and not pdf: return None
+    actions=('向下滑','向上滑','點選','點擊','按下','長按','短按','打開','開啟','進入','選擇','滑動','拖動','切換','點按','按住','調整','放大','縮放')
+    locations=('控制中心','快捷','設定','设置','選單','菜单','滑桿','滑杆','按鈕','按钮','選項','选项','工具列','螢幕','屏幕','頂端','顶部','閱讀','阅读','頁面','页面','字體','字体','重新排版')
+    found=[];seen=set()
+    for source in sources:
+        chunks=[x.strip() for x in re.split(r'(?<=[。！？!?；;])|\n+',source.get('excerpt','')) if x.strip()]
+        for i,chunk in enumerate(chunks):
+            if len(chunk)>300 or _looks_like_title(chunk,[source],question): continue
+            near=chunk+' '+(chunks[i-1] if i else '')+' '+str(source.get('locator',''))
+            if pdf and not any(x in chunk.lower() for x in ('字體','字体','字号','字號','排版','縮放','缩放','放大')): continue
+            if topics and not _matches_question_topic(question,near): continue
+            if topics and not _matches_question_topic(question,chunk) and re.search(r'wi[ -]?fi|藍牙|蓝牙',chunk,re.I): continue
+            if not any(x in chunk for x in actions) or not any(x in chunk for x in locations): continue
+            if chunk in seen: continue
+            seen.add(chunk);found.append((source,chunk))
+            if len(found)>=3: break
+        if len(found)>=3: break
+    if not found: return None
+    selected=[];lines=['以下是找到的相關內容，直接摘錄自文件或網路搜尋摘要，尚未整理為完整步驟；請查看來源確認適用機型。']
+    for source,chunk in found:
+        ident=source['id'];label='網路摘要（未核對）' if source.get('kind')==web_search.KIND else '原文';lines.append(label+' ['+str(ident)+']：'+chunk)
+        if not any(x['id']==ident for x in selected): selected.append(source)
+    if any('通用文件（未確認適用' in x.get('kind','') or x.get('scope_warning') for x in selected):
+        lines.insert(0,'⚠ 以下包含品牌通用資料，尚未確認適用你的機型。')
+    return '\n'.join(lines),selected
+
+
+def _insufficient_evidence(question,segments):
+    """Use an actual relevant source sentence explicitly saying information is absent."""
+    marks=('沒有說明','未說明','沒有記載','未記載','未提及','未提供','沒有提供','資料不足','無法確認')
+    stop={'如何','怎麼','什么','什麼','可以','是否','請問','哪些','是否','會不','不能'}
+    words=[]
+    for token in re.findall(r'[\u3400-\u9fff]+',question):
+        words.extend(token[i:i+2] for i in range(len(token)-1) if token[i:i+2] not in stop)
+    terms=set(words)
+    candidates=[]
+    for ident,quote in segments.values():
+        if not any(mark in quote for mark in marks): continue
+        score=sum(term in quote for term in terms)
+        if score>=1: candidates.append((score,ident,quote))
+    if not candidates: return None
+    _,ident,quote=max(candidates,key=lambda item:item[0])
+    return ident,quote
+
+
+def _supporting_source_sentences(body,quotes,segments):
+    """Add strongly matching sentences from already-cited documents, never a new source."""
+    ids={ident for ident,_ in quotes};existing=set(quotes);ranked=[]
+    for ident,quote in segments.values():
+        if ident not in ids or (ident,quote) in existing or quote.lstrip().startswith('#'): continue
+        score=difflib.SequenceMatcher(None,body,quote,autojunk=False).find_longest_match().size
+        if score>=6: ranked.append((score,ident,quote))
+    added=[]
+    for _,ident,quote in sorted(ranked,reverse=True):
+        if len(quotes)+len(added)>=4: break
+        candidate=(ident,quote)
+        if candidate not in added: added.append(candidate)
+    return quotes+added,bool(added)
+
+
 def _claim_warning(body,quotes):
     """Flag clear conflicting operation terms; this is not semantic verification."""
     text=' '.join(q for _,q in quotes)
@@ -519,30 +639,57 @@ def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434
                 try:
                     claims=_checked_claims(text,segments); break
                 except (ValueError,TypeError,KeyError,AttributeError):
+                    fallback=extract_relevant_steps(question,sources)
+                    if fallback: return fallback[0],fallback[1],response.get('usage',{})
                     if attempt: raise EvidenceError('本地模型未提供可核對的逐項來源；請重試、提高輸出上限或查看來源。') from None
                     payload['messages'][0]['content']+=' 每一項 evidence_ids 必須包含輸入中確實存在的 segment_id；不確定時請回傳空 items。'
                     response=post(local_endpoint(base),{'Content-Type':'application/json'},payload)
                     choices=response.get('choices') or []; text=(choices[0].get('message',{}).get('content') or '').strip() if choices else ''
             if not claims:
-                return '目前的搜尋片段不足以支持回答；請換個問題或查看原始文件。',[],response.get('usage',{})
-            lines=[]; ids=[]; all_quotes=[]
+                insufficient=_insufficient_evidence(question,segments)
+                if not insufficient:
+                    fallback=extract_relevant_steps(question,sources)
+                    if fallback: return fallback[0],fallback[1],response.get('usage',{})
+                    return '目前的搜尋片段不足以支持回答；請換個問題或查看原始文件。',[],response.get('usage',{})
+                ident,quote=insufficient; claims=[('文件記載：'+quote.strip(),[(ident,quote)])]
+            lines=[]; ids=[]; all_quotes=[]; seen_claims=set()
             for number,(body,quotes) in enumerate(claims,1):
                 quotes,model_reanchored=_claim_model_anchor(body,quotes,segments,sources)
                 quotes,reanchored=_claim_anchor(body,quotes,segments)
+                missing_marks=('沒有說明','未說明','沒有記載','未記載','未提及','未提供','沒有提供','資料不足','無法確認')
+                added_missing=False
+                if any(mark in body for mark in missing_marks) and not any(mark in quote for _,quote in quotes for mark in missing_marks):
+                    selected_ids={ident for ident,_ in quotes}
+                    missing=_insufficient_evidence(question,{i:item for i,item in segments.items() if item[0] in selected_ids})
+                    if missing and missing not in quotes: quotes=quotes+[missing]; added_missing=True
+                quotes,added_support=_supporting_source_sentences(body,quotes,segments)
                 claim_ids=list(dict.fromkeys(ident for ident,_ in quotes))
                 warning=_claim_warning(body,quotes)
                 title_like=any(term in body for term in ('使用指南','操作手冊','使用手冊')) and not any(term in body for term in ('開啟','點選','選擇','調整','按下','長按','短按','輸入','可以','提供','需要','說明','顯示'))
                 weak='回答與所選原文的文字關聯較弱' in warning
                 web_claim=all(any(source['id']==ident and source.get('kind')==web_search.KIND for source in sources) for ident in claim_ids)
-                if body.startswith('#') or title_like or body.strip().lower() in {Path(source.get('path','')).stem.lower() for source in sources} or (weak and not web_claim) or (web_claim and _web_unsupported_terms(body,quotes)):
+                normalized=re.sub(r'^(?:文件記載|根據文件(?:記載)?|資料顯示|依據文件)[:：，,\s]*','',body.strip())
+                claim_key=re.sub(r'[^a-z0-9\u3400-\u9fff]','',normalized.lower())
+                signature=(claim_key,tuple(sorted(claim_ids)))
+                if _looks_like_title(body,sources,question) or title_like or body.strip().lower() in {Path(source.get('path','')).stem.lower() for source in sources} or (weak and not web_claim) or (web_claim and _web_unsupported_terms(body,quotes)) or (claim_key and signature in seen_claims):
                     continue
+                if claim_key: seen_claims.add(signature)
                 ids.extend(claim_ids); all_quotes.extend(quotes)
                 lines.append(str(len([line for line in lines if re.match(r'^\d+\.',line)])+1)+'. '+('【網路摘要・未核對】' if web_claim else '')+body+' '+''.join(f'[{i}]' for i in claim_ids))
                 if warning: lines.append('   ⚠ '+'；'.join(warning)+'，請核對原文。')
+                if added_missing: lines.append('   已補上同一文件中說明資料不足的原文，仍須確認。')
+                if added_support: lines.append('   已依文字相似度補充同一文件的原文，仍須確認。')
                 if model_reanchored: lines.append('   已依回答中的明確機型名稱調整來源，仍須確認。')
                 elif reanchored: lines.append('   已依相同文件中的原文文字調整片段，仍須確認。')
                 for ident,quote in quotes: lines.append('   原文 ['+str(ident)+']：'+quote.strip())
-            if not lines: raise EvidenceError('模型未能根據來源整理出可靠回答；請查看候選來源或換個問法。')
+            if not lines:
+                insufficient=_insufficient_evidence(question,segments)
+                if not insufficient:
+                    fallback=extract_relevant_steps(question,sources)
+                    if fallback: return fallback[0],fallback[1],response.get('usage',{})
+                    raise EvidenceError('模型未能根據來源整理出可靠回答；請查看候選來源或換個問法。')
+                ident,quote=insufficient; ids=[ident]; all_quotes=[(ident,quote)]
+                lines=['1. 文件記載：'+quote.strip()+' ['+str(ident)+']','   原文 ['+str(ident)+']：'+quote.strip()]
             body='\n'.join(x[0] for x in claims)
             missing=_missing_operation_markers(body,all_quotes,question,sources)
             alerts=[]

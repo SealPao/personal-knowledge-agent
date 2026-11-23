@@ -185,6 +185,77 @@ class LocalModelTests(unittest.TestCase):
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
             with self.assertRaises(ai_service.EvidenceError):
                 ai_service.answer('BOOX 前光怎麼調整',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+    def test_product_titles_do_not_answer_frontlight_question(self):
+        title='【新機上市】文石 BOOX Go 10.3 吋 (Gen II) 電子閱讀器 - 白色 [現貨]'
+        sources=[{'id':1,'path':'BOOX-Go-10.3-Gen-II.md','excerpt':title}]
+        def post(url,headers,payload):
+            content=json.dumps({'items':[{'text':title,'evidence_ids':[1]}]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            with self.assertRaises(ai_service.EvidenceError):
+                ai_service.answer('我要怎麼調整 boox go 10 的前光',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+    def test_echoed_question_does_not_hide_explicit_missing_information(self):
+        sources=[{'id':1,'excerpt':'BOOX Go 7 可從設定進入重置頁面。此文件沒有說明重置是否刪除書籍。'}]
+        def post(url,headers,payload):
+            content=json.dumps({'items':[{'text':'BOOX Go 7 重置會刪除哪些書籍？','evidence_ids':[1]}]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,cited,_=ai_service.answer('BOOX Go 7 重置會刪除哪些書籍？',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertIn('此文件沒有說明重置是否刪除書籍',text);self.assertEqual(cited,sources)
+        self.assertNotIn('重置會刪除哪些書籍？ [1]',text)
+    def test_question_echo_is_not_shown_as_a_claim(self):
+        sources=[{'id':1,'excerpt':'PocketBook Era：長按電源鍵，選擇關機。'}]
+        q='比較 PocketBook Era 和 Verse 的關機方式'
+        def post(url,headers,payload):
+            content=json.dumps({'items':[{'text':q,'evidence_ids':[1]},{'text':'長按電源鍵，選擇關機。','evidence_ids':[1]}]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,_,_=ai_service.answer(q,sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertNotIn(q,text);self.assertIn('長按電源鍵',text)
+    def test_missing_information_claim_has_corresponding_source_sentence(self):
+        sources=[{'id':1,'excerpt':'BOOX Go 7 可從設定進入重置頁面。此文件沒有說明重置是否刪除書籍。'}]
+        def post(url,headers,payload):
+            content=json.dumps({'items':[{'text':'可以進入重置頁面，但文件沒有說明是否刪除書籍。','evidence_ids':[1]}]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,_,_=ai_service.answer('BOOX Go 7 重置會刪除哪些書籍？',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertIn('原文 [1]：此文件沒有說明重置是否刪除書籍。',text)
+    def test_duplicate_with_introductory_phrase_is_not_repeated(self):
+        sources=[{'id':1,'excerpt':'對於文字型 PDF，可以在閱讀選單中選擇文字重新排版，進而調整字體大小。'}]
+        def post(url,headers,payload):
+            text='對於文字型 PDF，可以在閱讀選單中選擇文字重新排版，進而調整字體大小。'
+            content=json.dumps({'items':[{'text':text,'evidence_ids':[1]},{'text':'文件記載：'+text,'evidence_ids':[1]}]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,_,_=ai_service.answer('如何調整 PDF 字體？',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertIn('1. ',text);self.assertNotIn('2. ',text)
+    def test_extractive_fallback_uses_only_relevant_actionable_original_text(self):
+        q='BOOX Go 7 如何調整前光？'
+        sources=[{'id':1,'path':'BOOX 手冊.md','kind':'BOOX 通用文件（未確認適用 go7）',
+                  'excerpt':'# 前光\nBOOX 前光可以調整。\n從螢幕頂端向下滑動，打開控制中心。\n# Wi-Fi\n開啟設定並選擇 Wi-Fi。'}]
+        result=ai_service.extract_relevant_steps(q,sources)
+        self.assertIsNotNone(result);text,refs=result
+        self.assertIn('尚未確認適用',text);self.assertIn('向下滑動',text)
+        self.assertNotIn('Wi-Fi',text);self.assertEqual(refs,sources)
+        self.assertIsNone(ai_service.extract_relevant_steps(q,[{'id':2,'path':'x.md','excerpt':'前光介紹。具體操作如下。'}]))
+    def test_pdf_extractive_fallback_keeps_relevant_text_and_omits_other_topics(self):
+        sources=[{'id':1,'path':'BOOX 手冊.md','kind':'BOOX 通用文件（未確認適用 go7）',
+                  'excerpt':'# PDF 閱讀\n文字型 PDF：在閱讀選單選擇文字重新排版，再調整字體大小。\n# 網路\n開啟設定並選擇 Wi-Fi。'}]
+        text,refs=ai_service.extract_relevant_steps('BOOX Go 7 如何調整 PDF 字體？',sources)
+        self.assertIn('重新排版',text);self.assertNotIn('Wi-Fi',text);self.assertEqual(refs,sources)
+    def test_invalid_local_response_uses_relevant_original_without_second_generation(self):
+        sources=[{'id':1,'path':'BOOX 手冊.md','kind':'BOOX 通用文件（未確認適用 go7）',
+                  'excerpt':'# 前光\nBOOX 前光設定。\n從螢幕頂端向下滑動，打開控制中心。'}];calls=[]
+        def post(url,headers,payload):
+            calls.append(1);return {'choices':[{'message':{'content':'{invalid'}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,cited,_=ai_service.answer('BOOX Go 7 如何調整前光？',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertEqual(len(calls),1);self.assertIn('向下滑動',text);self.assertEqual(cited,sources)
+    def test_multi_fact_claim_gets_matching_sentences_from_same_source(self):
+        segments={1:(1,'BOOX Go 7 在文字型 PDF 的閱讀選單選擇文字重新排版，再調整字體大小。'),2:(1,'掃描型 PDF 可能不支援文字重新排版。'),3:(2,'另一台裝置的文字重新排版，再調整字體大小。')}
+        body='選擇文字重新排版，再調整字體大小。掃描型 PDF 可能不支援文字重新排版。'
+        quotes,added=ai_service._supporting_source_sentences(body,[segments[2]],segments)
+        self.assertTrue(added);self.assertIn(segments[1],quotes);self.assertNotIn(segments[3],quotes)
     def test_no_claims_returns_clear_abstention(self):
         sources=[{'id':1,'excerpt':'僅有充電說明。'}]
         def post(url,headers,payload): return {'choices':[{'message':{'content':'{"items":[]}'}}]}

@@ -53,6 +53,30 @@ class AITests(unittest.TestCase):
         self.assertTrue(refs); self.assertTrue(any('通用使用指南' in x['path'] for x in refs))
         self.assertTrue(all('Go 70' not in x['path'] for x in refs))
         self.assertTrue(all('通用文件（未確認適用' in x['kind'] for x in refs))
+    def test_decimal_models_do_not_silently_match_shorter_model(self):
+        self.assertTrue(ai.matches_model('BOOX Go 10.3 Gen II','go 10.3'))
+        self.assertFalse(ai.matches_model('BOOX Go 10.3 Gen II','go 10'))
+        self.assertEqual(ai.model_identifiers('BOOX Go 10.3 前光'),['go 10.3'])
+    def test_frontlight_search_does_not_accept_model_or_marketing_only(self):
+        (self.source/'BOOX 通用.md').write_text('# 產品\nBOOX 產品外觀。\n# Wi-Fi\n進入設定調整 Wi-Fi。',encoding='utf8')
+        (self.source/'BOOX 前光手冊.md').write_text('# 燈光\nBOOX 前光可在控制中心調整。',encoding='utf8')
+        core.scan(str(self.source),str(self.db))
+        refs=ai.retrieve_with_general_fallback(str(self.db),'我要怎麼調整 boox go 10 的前光')
+        self.assertTrue(refs); self.assertTrue(all('前光' in x['excerpt'] or 'frontlight' in x['excerpt'].lower() for x in refs))
+        self.assertFalse(any(Path(x['path']).name=='BOOX 通用.md' for x in refs))
+    def test_frontlight_retrieval_includes_adjacent_steps_in_same_section(self):
+        path=self.source/'BOOX 通用操作手冊.html'
+        path.write_text('<h2>前光</h2><p>前光的操作方式如下。</p><p>從螢幕頂端向下滑動，打開控制中心。</p><p>拖動滑桿，改變亮度。</p><h2>Wi-Fi</h2><p>點選網路名稱連線。</p>',encoding='utf8')
+        core.scan(str(self.source),str(self.db))
+        refs=ai.retrieve_with_general_fallback(str(self.db),'BOOX Go 10 如何調整前光')
+        text=' '.join(x['excerpt'] for x in refs)
+        self.assertTrue(refs);self.assertTrue('控制中心' in text or '滑桿' in text)
+        self.assertNotIn('網路名稱',text)
+    def test_original_text_fallback_is_visible_but_normal_evidence_is_hidden(self):
+        fallback='以下是找到的相關內容，直接摘錄自文件或網路搜尋摘要。\n原文 [1]：從螢幕頂端向下滑動。'
+        normal='1. 從螢幕頂端向下滑動。 [1]\n   原文 [1]：從螢幕頂端向下滑動。'
+        self.assertIn('原文：從螢幕頂端',ai_ui.AIWindow._compact_reply(fallback))
+        self.assertNotIn('原文',ai_ui.AIWindow._compact_reply(normal))
     def test_followup_context_bounded_and_not_document_evidence(self):
         history=[{'question':'BOOX palma3 前光在哪裡','answer':'之前的回答'}]
         self.assertIn('palma3',ai.search_question('那它的亮度呢？',history))

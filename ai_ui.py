@@ -176,9 +176,9 @@ class AIWindow(tk.Toplevel):
         self.answer_box.configure(state='normal'); self.answer_box.insert('end','\n\n'+role+'：\n'+value); self.answer_box.see('end'); self.answer_box.configure(state='disabled')
     @staticmethod
     def _compact_reply(value):
-        lines=[]
+        lines=[]; verbatim=value.startswith('以下是找到的相關內容') or '以下是找到的相關內容' in value
         for line in value.splitlines():
-            if line.lstrip().startswith(('原文 [','已依相同文件','已依回答中的明確機型','每項後方顯示對照原文')): continue
+            if line.lstrip().startswith(('已依相同文件','已依回答中的明確機型','已依文字相似度補充','每項後方顯示對照原文')) or (not verbatim and line.lstrip().startswith('原文 [')): continue
             lines.append(re.sub(r'\s*\[\d+\]','',line))
         return '\n'.join(lines).strip()
     def _answer_text(self,value):

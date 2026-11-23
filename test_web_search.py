@@ -30,6 +30,10 @@ class WebSearchTests(unittest.TestCase):
         source=web_search.to_sources(selected)[0]; self.assertEqual(source['kind'],web_search.KIND)
         content,_=ai_service._local_segment_input('問題',[source]); self.assertIn('未確認適用',content)
         self.assertEqual(ai_service.select_web_results('go7 PDF',items),[])
+    def test_extractive_web_results_are_labelled_as_snippets(self):
+        sources=web_search.to_sources([{'url':'https://example.org/doc','title':'Manual','snippet':'前光設定：從螢幕頂端向下滑動，打開控制中心。'}])
+        text,refs=ai_service.extract_relevant_steps('如何調整前光',sources)
+        self.assertIn('網路摘要（未核對）',text);self.assertNotIn('原文 [1]',text);self.assertEqual(refs,sources)
     def test_web_snippets_are_marked_and_not_sent_to_search(self):
         sources=web_search.to_sources([{'url':'https://example.org/doc','title':'Official','snippet':'Open settings.'}])
         content,segments=ai_service._local_segment_input('How?',sources)
