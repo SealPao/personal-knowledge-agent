@@ -49,7 +49,7 @@ class AIWindow(tk.Toplevel):
     def __init__(self,master,db_path):
         super().__init__(master); self.title('AI 問答 · 私人知識助理'); self.geometry('1080x760'); self.minsize(850,620); self.configure(bg=BG)
         self.db=Path(db_path); self.config_path=self.db.parent/'ai-settings.json'; self.config=read_config(self.config_path)
-        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running(); self.answer_started=None; self.download_phase='準備下載'; self.history=[]; self.pending_question=''; self.last_details=''; self.return_to_main=False; self.clarify_question=''
+        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running(); self.answer_started=None; self.download_phase='準備下載'; self.history=[]; self.pending_question=''; self.last_details=''; self.return_to_main=False; self.clarify_question=''; self.last_unanswered_question=''
         self.question=tk.StringVar(); self.hint=tk.StringVar(); self._set_hint()
         head=tk.Frame(self,bg=BG); head.pack(fill='x',padx=25,pady=(20,12))
         lab(head,'與你的文件對話',bg=BG,font=(FONT,19,'bold')).pack(side='left')
@@ -170,7 +170,7 @@ class AIWindow(tk.Toplevel):
         else: self.chat_body.add(self.source_panel,minsize=280,stretch='always'); self.source_visible=True
     def new_chat(self):
         if self.busy: return
-        self.history=[]; self.pending_question=''; self.clarify_question=''; self.last_details=''; self.sources_by_row=[]; self.cites.delete(*self.cites.get_children()); self._source_text('')
+        self.history=[]; self.pending_question=''; self.clarify_question=''; self.last_unanswered_question=''; self.last_details=''; self.sources_by_row=[]; self.cites.delete(*self.cites.get_children()); self._source_text('')
         self._answer_text('已開始新對話。')
     def _append_chat(self,role,value):
         self.answer_box.configure(state='normal'); self.answer_box.insert('end','\n\n'+role+'：\n'+value); self.answer_box.see('end'); self.answer_box.configure(state='disabled')
@@ -258,6 +258,8 @@ class AIWindow(tk.Toplevel):
             except Exception as e: messagebox.showerror('無法讀取 Key',str(e),parent=self); return
             if not exists: messagebox.showinfo('請設定 API Key','請先在 AI 設定儲存 OpenAI API Key。',parent=self); return
         visible_q=q
+        if self.last_unanswered_question and q.strip(' ！!？?。') in ('再試一次','再试一次','再搜尋一次','再搜索一次','重新搜尋','重新搜索'):
+            q=self.last_unanswered_question
         if self.clarify_question and len(q)<=60 and not re.search(r'[?？]|(怎麼|如何|怎麽|哪裡|为何|為什麼)',q):
             q=(self.clarify_question+'；補充品牌或機型：'+q)[:svc.MAX_QUESTION]
         self.clarify_question=''
@@ -266,13 +268,12 @@ class AIWindow(tk.Toplevel):
         if use_web: self.status.set('正在本地搜尋，並將問題傳送至 DuckDuckGo…')
         def work():
             try:
-                sources=svc.retrieve(str(self.db),svc.search_question(q,self.history))
+                sources=svc.retrieve_with_general_fallback(str(self.db),svc.search_question(q,self.history))
                 if use_web:
                     try:
-                        found=web_search.search(q)
-                        models=svc.model_identifiers(q)
-                        if models: found=[item for item in found if all(svc.matches_model(item['title']+' '+item['snippet'],term) for term in models)]
-                        if not found: self.events.put(('web_error','網路摘要沒有明確匹配指定型號'))
+                        found=web_search.search(q.replace('；補充品牌或機型：',' '))
+                        found=svc.select_web_results(q,found)
+                        if not found: self.events.put(('web_error','網路摘要沒有明確匹配指定型號，也沒有可用的品牌通用資料'))
                         sources=sources[:3]+web_search.to_sources(found,start=min(len(sources),3)+1)
                     except Exception as e: self.events.put(('web_error',str(e)))
                 self.events.put(('retrieved',(q,sources,approved,review)))
@@ -291,7 +292,7 @@ class AIWindow(tk.Toplevel):
         selected=[]
         for source in sources:
             enabled=tk.BooleanVar(value=True); selected.append(enabled)
-            tk.Checkbutton(choices,text=f'[{source["id"]}] {Path(source["path"]).name} · {source.get("kind","未確認")}',variable=enabled,bg=WHITE,fg=INK,font=(FONT,9),anchor='w').pack(fill='x')
+            tk.Checkbutton(choices,text=f'[{source["id"]}] {source.get("title") or Path(source["path"]).name} · {source.get("scope_warning") or source.get("kind","未確認")}',variable=enabled,bg=WHITE,fg=INK,font=(FONT,9),anchor='w').pack(fill='x')
         buttons=tk.Frame(w,bg=WHITE); buttons.pack(side='bottom',fill='x',padx=20,pady=15)
         def cancel(): w.destroy(); self._set_busy(False); self.status.set('已取消傳送。')
         approved=dict(self.config)
@@ -308,7 +309,7 @@ class AIWindow(tk.Toplevel):
             text.insert('end','近期對話（將與問題一同傳送）：\n')
             for turn in svc.bounded_history(self.history): text.insert('end','你：'+turn['question']+'\n助理：'+turn['answer']+'\n\n')
         text.insert('end','問題：'+q+'\n\n')
-        for s in sources: text.insert('end',f'[{s["id"]}] {Path(s["path"]).name} · {s["locator"]}\n來源類型：{s.get("kind","未確認")}\n{s["excerpt"]}\n\n')
+        for s in sources: text.insert('end',f'[{s["id"]}] {s.get("title") or Path(s["path"]).name} · {s["locator"]}\n來源類型：{s.get("scope_warning") or s.get("kind","未確認")}\n{s["excerpt"]}\n\n')
         text.configure(state='disabled'); w.protocol('WM_DELETE_WINDOW',cancel)
 
     def stop_local_answer(self):
@@ -336,7 +337,8 @@ class AIWindow(tk.Toplevel):
                 if config['provider']=='openai': ticket=budget.reserve(self.db,q,sources,config['openai_model'],config['max_tokens'],extra_input_tokens=len(json.dumps(context,ensure_ascii=False).encode('utf8'))+64)
                 result=svc.answer(q,sources,config['provider'],config['openai_model'] if config['provider']=='openai' else config['local_model'],key,config['local_base'],config['max_tokens'],network_enabled=config['network_enabled'],history=context)
                 if ticket: budget.finish(self.db,ticket,result[2])
-                self.events.put(('answer',result))
+                if not result[1]: self.events.put(('unverified',sources))
+                else: self.events.put(('answer',result))
             except svc.EvidenceError:
                 self.events.put(('unverified',sources))
             except Exception as e:
@@ -355,28 +357,48 @@ class AIWindow(tk.Toplevel):
                     q,sources,approved,review=value
                     if not sources:
                         self._set_busy(False)
-                        model=svc.model_identifiers(q)
-                        if model:
-                            self.clarify_question=q; self._append_chat('助理',f'我目前找不到能確認「{model[0]}」的資料。請問它是哪個品牌和完整型號？如果方便，也可以告訴我韌體版本。')
+                        model=svc.model_identifiers(q); self.last_unanswered_question=q
+                        supplemented=q.split('補充品牌或機型：',1)[1].strip() if '補充品牌或機型：' in q else ''
+                        brand_reply=re.sub(r'(?<![a-z0-9])[a-z][a-z0-9-]*\s*\d[a-z0-9-]*(?![a-z0-9])',' ',supplemented,flags=re.I)
+                        brand_reply=re.sub(r'[\W_\d]+',' ',brand_reply,flags=re.UNICODE).strip()
+                        brand_reply=re.sub(r'是|我的|我用|這是|这是|品牌|型號|型号|沒有|没有|不知道',' ',brand_reply).strip()
+                        has_brand_reply=bool(re.search(r'[A-Za-z]{2,}|[\u3400-\u9fff]{2,}',brand_reply))
+                        known_brand=bool(re.search(r'(?<![a-z0-9])(boox|kobo|pubook|mooink|hyread|bigme|supernote)(?![a-z0-9])',q,re.I)) or has_brand_reply
+                        if model and not known_brand:
+                            self.clarify_question=q; self._append_chat('助理',f'請問「{model[0]}」是哪個品牌？我需要確認後才能查找。')
+                        elif model:
+                            self.clarify_question=''; self._append_chat('助理',f'已記下品牌和「{model[0]}」，但目前找不到適用的文件或摘要。你可以匯入手冊，或開啟網路搜尋後輸入「再試一次」。')
+                        elif re.search(r'pdf',q,re.I) and not known_brand:
+                            self.clarify_question=q; self._append_chat('助理','PDF 的頁面縮放與文字重新排版是不同功能，是否可調整字體也取決於 PDF 和閱讀 APP。請問你使用哪一台閱讀器及哪個閱讀 APP？')
                         else: self._append_chat('助理','找不到明確符合的資料。你能提供品牌、完整型號，或補充想操作的功能嗎？')
-                        self.status.set('等待你補充資訊。')
+                        self.status.set('資料不足；可開啟網路搜尋後重試。' if model and known_brand else '等待你補充資訊。')
                     elif review: self.preview(q,sources)
                     else: self.send(None,q,sources,approved)
                 elif kind=='error': self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._append_chat('助理','無法完成：'+value); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
                 elif kind=='unverified':
                     self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.sources_by_row=value
-                    self._append_chat('助理','目前無法根據找到的資料可靠地整理答案。可按「顯示／隱藏來源」查看候選文件，或換個問法。')
+                    if re.search(r'pdf',self.pending_question,re.I) and not svc.model_identifiers(self.pending_question) and not re.search(r'boox|kobo|pubook|mooink|hyread|bigme|supernote',self.pending_question,re.I):
+                        self.clarify_question=self.pending_question; self._append_chat('助理','PDF 的頁面縮放與文字重新排版是不同功能，是否可調整字體也取決於 PDF 和閱讀 APP。請問你使用哪一台閱讀器及哪個閱讀 APP？')
+                    else:
+                        self.last_unanswered_question=self.pending_question; self._append_chat('助理','目前找到的資料不足以可靠回答。可按「顯示／隱藏來源」查看候選文件，或開啟網路搜尋後輸入「再試一次」。')
                     self.cites.delete(*self.cites.get_children()); self._source_text('')
                     for i,source in enumerate(value): self.cites.insert('','end',iid=str(i),values=(f'[{source["id"]}]',Path(source['path']).name,source['locator']))
                     if value: self.cites.selection_set('0'); self.source_select()
                     self.status.set('來源核對未通過；右側顯示搜尋到的候選來源。')
                 elif kind=='answer':
-                    text,sources,usage=value; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.last_details=text; reply=self._compact_reply(text); self._append_chat('助理',reply); self.history.append({'question':self.pending_question,'answer':reply}); self.history=self.history[-10:]; self.sources_by_row=sources
+                    text,sources,usage=value; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.last_details=text; reply=self._compact_reply(text)
+                    if not sources:
+                        self.last_unanswered_question=self.pending_question
+                        if re.search(r'pdf',self.pending_question,re.I) and not svc.model_identifiers(self.pending_question) and not re.search(r'boox|kobo|pubook|mooink|hyread|bigme|supernote',self.pending_question,re.I):
+                            self.clarify_question=self.pending_question
+                            reply='PDF 的頁面縮放與文字重新排版是不同功能，是否可調整字體也取決於 PDF 和閱讀 APP。請問你使用哪一台閱讀器及哪個閱讀 APP？'
+                        else: reply='目前找到的資料不足以可靠回答。可按「顯示／隱藏來源」查看候選文件，或開啟網路搜尋後輸入「再試一次」。'
+                    self._append_chat('助理',reply); self.history.append({'question':self.pending_question,'answer':reply}); self.history=self.history[-10:]; self.sources_by_row=sources
                     self.cites.delete(*self.cites.get_children()); self._source_text('')
                     for i,s in enumerate(sources): self.cites.insert('','end',iid=str(i),values=(f'[{s["id"]}]',s.get('title') or Path(s['path']).name,s['locator']))
                     if sources: self.cites.selection_set('0'); self.source_select()
                     stale=any(svc.source_state(source) for source in sources)
-                    self.status.set('來源在回答期間變更或無法存取；請重新掃描並提問。' if stale else '回答已產生。請核對來源類型與片段；AI 回答可能有錯誤。')
+                    self.status.set('來源在回答期間變更或無法存取；請重新掃描並提問。' if stale else '回答已產生。請核對來源類型與片段；AI 回答可能有錯誤。' if sources else '資料不足，請補充資訊或重試。')
                 elif kind=='connection_test':
                     ok,description=value
                     if ok: messagebox.showinfo('連線測試',description,parent=self)
@@ -423,7 +445,7 @@ class AIWindow(tk.Toplevel):
         if not selected: return
         s=self.sources_by_row[int(selected[0])]
         state=svc.source_state(s)
-        self._source_text((state+'。\n' if state else '')+'來源類型：'+s.get('kind','未確認')+'\n'+s['path']+'\n'+s['locator']+'\n\n'+s['excerpt']+'\n\n逐項引用：\n'+getattr(self,'last_details',''))
+        self._source_text((state+'。\n' if state else '')+'來源類型：'+(s.get('scope_warning') or s.get('kind','未確認'))+'\n'+s['path']+'\n'+s['locator']+'\n\n'+s['excerpt']+'\n\n逐項引用：\n'+getattr(self,'last_details',''))
     def open_source(self):
         selected=self.cites.selection()
         if not selected: return

@@ -45,6 +45,14 @@ class AITests(unittest.TestCase):
         core.scan(str(self.source),str(self.db))
         refs=ai.retrieve(str(self.db),'我想知道怎麼調整 go7 的刷新')
         self.assertTrue(refs); self.assertTrue(all('Go 7' in item['path'] for item in refs))
+    def test_generic_brand_manual_is_marked_when_exact_model_missing(self):
+        (self.source/'BOOX 通用使用指南.md').write_text('# PDF\nBOOX PDF 閱讀時可以放大頁面並調整文字重新排版。',encoding='utf8')
+        (self.source/'BOOX Go 70.md').write_text('# PDF\nBOOX Go 70 PDF 調整字體大小。',encoding='utf8')
+        core.scan(str(self.source),str(self.db))
+        refs=ai.retrieve_with_general_fallback(str(self.db),'我用 go7 要怎麼調整 pdf 的字體大小；補充品牌或機型：boox go 7')
+        self.assertTrue(refs); self.assertTrue(any('通用使用指南' in x['path'] for x in refs))
+        self.assertTrue(all('Go 70' not in x['path'] for x in refs))
+        self.assertTrue(all('通用文件（未確認適用' in x['kind'] for x in refs))
     def test_followup_context_bounded_and_not_document_evidence(self):
         history=[{'question':'BOOX palma3 前光在哪裡','answer':'之前的回答'}]
         self.assertIn('palma3',ai.search_question('那它的亮度呢？',history))

@@ -21,6 +21,15 @@ class WebSearchTests(unittest.TestCase):
         quotes=[(1,'We provide different refresh modes.')]
         self.assertIn('Regal',ai_service._web_unsupported_terms('可以使用 Regal Mode。',quotes))
         self.assertEqual(ai_service._web_unsupported_terms('可以調整 refresh modes。',quotes),[])
+    def test_generic_brand_web_snippet_is_marked_and_other_model_excluded(self):
+        items=[{'title':'BOOX PDF 操作指南','url':'https://help.boox.com/pdf','snippet':'PDF 可以縮放頁面。'},
+               {'title':'BOOX Go 70','url':'https://example.org/go70','snippet':'BOOX Go 70 的 PDF 操作。'},
+               {'title':'Kobo PDF','url':'https://example.org/kobo','snippet':'Kobo PDF。'}]
+        selected=ai_service.select_web_results('BOOX go7 如何調整 PDF 字體',items)
+        self.assertEqual(len(selected),1); self.assertIn('未確認適用',selected[0]['scope_warning'])
+        source=web_search.to_sources(selected)[0]; self.assertEqual(source['kind'],web_search.KIND)
+        content,_=ai_service._local_segment_input('問題',[source]); self.assertIn('未確認適用',content)
+        self.assertEqual(ai_service.select_web_results('go7 PDF',items),[])
     def test_web_snippets_are_marked_and_not_sent_to_search(self):
         sources=web_search.to_sources([{'url':'https://example.org/doc','title':'Official','snippet':'Open settings.'}])
         content,segments=ai_service._local_segment_input('How?',sources)

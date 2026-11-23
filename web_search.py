@@ -73,4 +73,4 @@ def search(question,opener=None):
 
 def to_sources(results,start=1):
     return [{'id':start+i,'path':r['url'],'url':r['url'],'title':r['title'],'locator':'搜尋結果摘要',
-             'excerpt':r['snippet'],'kind':KIND} for i,r in enumerate(results)]
+             'excerpt':r['snippet'],'kind':KIND,**({'scope_warning':r['scope_warning']} if r.get('scope_warning') else {})} for i,r in enumerate(results)]
