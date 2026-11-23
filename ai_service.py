@@ -236,6 +236,9 @@ def test_connection(provider,key=None,base='http://127.0.0.1:11434/v1',network_e
     except urllib.error.URLError: raise RuntimeError('無法連接服務，請檢查網路或本地服務') from None
     return len(parsed['data'])
 
+class EvidenceError(RuntimeError):
+    """A model answer could not be tied to exact source text."""
+
 def _checked_evidence(raw,sources):
     """Require exact, short excerpts for each model-selected source."""
     parsed=json.loads(raw); ids=parsed['citations']; body=parsed['answer'].strip(); evidence=parsed['evidence']
@@ -312,7 +315,7 @@ def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434
                 try:
                     body,ids,quotes=_checked_evidence(text,sources); break
                 except (ValueError,TypeError,KeyError,AttributeError):
-                    if attempt: raise RuntimeError('本地模型未提供可核對的來源原文；請重試、提高輸出上限或查看來源。') from None
+                    if attempt: raise EvidenceError('本地模型未提供可核對的來源原文；請重試、提高輸出上限或查看來源。') from None
                     payload['messages'][0]['content']+=' 請確認 evidence 的每個 quote 是相應 excerpt 中連續、逐字的原文，且各引用都有 quote。'
                     response=post(local_endpoint(base),{'Content-Type':'application/json'},payload)
                     choices=response.get('choices') or []; text=(choices[0].get('message',{}).get('content') or '').strip() if choices else ''

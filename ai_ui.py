@@ -264,7 +264,7 @@ class AIWindow(tk.Toplevel):
         if config['provider']=='openai' and not config['network_enabled']:
             self._set_busy(False); self.status.set('外網存取已關閉，未傳送問題或片段。'); return
         self.answer_started=time.monotonic()
-        self.answer_backend='內建本地 AI（速度取決於硬體，可能需數分鐘）' if config['provider']=='local' and config['local_model']==local_ai.MODEL else 'OpenAI' if config['provider']=='openai' else '本機模型服務'
+        self.answer_backend='內建本地 AI（可能重試來源核對，需數分鐘）' if config['provider']=='local' and config['local_model']==local_ai.MODEL else 'OpenAI' if config['provider']=='openai' else '本機模型服務'
         if config['provider']=='local' and config['local_model']==local_ai.MODEL and local_ai.running():
             self.stop_answer_button.configure(state='normal'); self.stop_answer_button.pack(anchor='w',pady=(4,0))
         def work():
@@ -276,6 +276,8 @@ class AIWindow(tk.Toplevel):
                 result=svc.answer(q,sources,config['provider'],config['openai_model'] if config['provider']=='openai' else config['local_model'],key,config['local_base'],config['max_tokens'],network_enabled=config['network_enabled'])
                 if ticket: budget.finish(self.db,ticket,result[2])
                 self.events.put(('answer',result))
+            except svc.EvidenceError:
+                self.events.put(('unverified',sources))
             except Exception as e:
                 if ticket:
                     try: budget.uncertain(self.db,ticket)
@@ -293,6 +295,13 @@ class AIWindow(tk.Toplevel):
                     elif not sources: self._set_busy(False); self._answer_text('找不到可用來源，請換個問題或確認文件已匯入。'); self.status.set('沒有找到可用來源。')
                     else: self.send(None,q,sources,approved)
                 elif kind=='error': self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._answer_text('無法完成：'+value); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
+                elif kind=='unverified':
+                    self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.sources_by_row=value
+                    self._answer_text('本地模型的回答未通過來源原文核對，因此未顯示該回答。右側列出搜尋到的文件供你查看；它們是候選來源，不代表已證實答案。你可以調整問題或提高 AI 設定中的輸出 Token 上限後再試。')
+                    self.cites.delete(*self.cites.get_children()); self._source_text('')
+                    for i,source in enumerate(value): self.cites.insert('','end',iid=str(i),values=(f'[{source["id"]}]',Path(source['path']).name,source['locator']))
+                    if value: self.cites.selection_set('0'); self.source_select()
+                    self.status.set('來源核對未通過；右側顯示搜尋到的候選來源。')
                 elif kind=='answer':
                     text,sources,usage=value; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._answer_text(text); self.sources_by_row=sources
                     self.cites.delete(*self.cites.get_children()); self._source_text('')
