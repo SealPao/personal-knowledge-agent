@@ -71,6 +71,7 @@ class App(tk.Tk):
         button(sidebar,'✦  AI 問答',self.open_ai,bg='#30445b',fg=WHITE).pack(fill='x',padx=20,pady=(15,0))
         button(sidebar,'▤  文件管理與編輯',self.open_documents,bg='#30445b',fg=WHITE).pack(fill='x',padx=20,pady=(6,0))
         button(sidebar,'整理與匯出',self.open_organize,bg='#30445b',fg=WHITE).pack(fill='x',padx=20,pady=(6,0))
+        button(sidebar,'整庫整理（試用）',self.open_batch_organize,bg='#30445b',fg=WHITE).pack(fill='x',padx=20,pady=(6,0))
         button(sidebar,'選擇或匯入知識庫',self.library_options,bg='#30445b',fg=WHITE).pack(fill='x',padx=20,pady=(6,0))
         label(sidebar,'知識庫',bg=NAVY,fg='#9cb0c5',font=(FONT,9,'bold')).pack(anchor='w',padx=24,pady=(30,6))
         label(sidebar,textvariable=self.metrics,bg=NAVY,fg='#dbeafe',justify='left',wraplength=170).pack(anchor='w',padx=24)
@@ -129,6 +130,12 @@ class App(tk.Tk):
         self.details=tk.Text(reading,wrap='word',font=(FONT,11),fg=INK,bg=WHITE,bd=0,relief='flat',spacing1=4,spacing3=6,padx=2,pady=2)
         vbar=ttk.Scrollbar(reading,orient='vertical',command=self.details.yview); self.details.configure(yscrollcommand=vbar.set)
         self.details.pack(side='left',fill='both',expand=True); vbar.pack(side='right',fill='y'); self.details.configure(state='disabled')
+
+    def open_batch_organize(self):
+        if getattr(self,'batch_organizer',None) and self.batch_organizer.winfo_exists():
+            self.batch_organizer.lift(); return
+        import organize_batch_ui
+        self.batch_organizer=organize_batch_ui.OrganizeBatchWindow(self,DB)
 
     def refresh_metrics(self):
         if not DB.exists(): self.metrics.set('尚未建立索引'); self.status.set('選擇來源資料夾後建立索引。'); return
