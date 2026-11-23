@@ -52,7 +52,7 @@ class OrganizeBatchWindow(tk.Toplevel):
         info=batch.stats(self.db,self.job);counts=info['counts'];self.progress['value']=100*info['processed']/max(info['documents'],1)
         self.status.set(f"文件已處理 {info['processed']} / {info['documents']}；待執行片段 {counts.get('pending',0)}，待校對 {counts.get('review',0)}，失敗 {counts.get('failed',0)}，略過 {counts.get('skipped',0)}，狀態未知 {counts.get('unknown',0)}。\nToken 保守預留 {info['reserved']} / {info['limit']}；這不是官方實際用量。完成比例包含待校對及失敗文件。")
         db=batch.connect(self.db)
-        try:self.rows=db.execute("SELECT path,locator,state,result,detail FROM organize_items WHERE job_id=? ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'review' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,id LIMIT 300",(self.job,)).fetchall()
+        try:self.rows=db.execute("SELECT path,locator,state,result,detail FROM organize_items WHERE job_id=? ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'pending' THEN 1 WHEN 'failed' THEN 2 WHEN 'review' THEN 3 ELSE 4 END,id LIMIT 300",(self.job,)).fetchall()
         finally:db.close()
         self.tree.delete(*self.tree.get_children())
         states={'pending':'待處理','running':'處理中','review':'待校對','failed':'失敗','skipped':'略過','unknown':'中斷待檢查'}

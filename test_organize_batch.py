@@ -36,6 +36,21 @@ class TestBatch(unittest.TestCase):
   db.close();b.set_limit(self.db,job,12000);self.assertEqual(b.stats(self.db,job)['reserved'],2000);self.assertEqual(b.stats(self.db,job)['limit'],12000)
   with self.assertRaises(ValueError):b.set_limit(self.db,job,1000)
 
+ def test_html_grouping_and_round_robin_across_documents(self):
+  html=self.src/'manual.html';html.write_text('<h1>使用說明</h1>'+''.join(f'<p>步驟{i}：開啟設定選單。</p>' for i in range(250)),encoding='utf8')
+  other=self.src/'other.md';other.write_text('# 其他\n這是另一份文件。',encoding='utf8')
+  core.scan(str(self.src),str(self.db));job=b.create(self.db,self.cfg,1000000);db=b.connect(self.db)
+  try:
+   original=db.execute('SELECT count(*) FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.path=?',(str(html.resolve()),)).fetchone()[0]
+   grouped=db.execute('SELECT count(*) FROM organize_items WHERE job_id=? AND path=?',(job,str(html.resolve()))).fetchone()[0]
+  finally:db.close()
+  self.assertGreater(original,100);self.assertLess(grouped,original//2)
+  names=[]
+  def answer(question,sources,*args,**kwargs):
+   names.append(sources[0]['path']);return ('草稿 [1]',sources,{})
+  with patch.object(b.ai_service,'answer',side_effect=answer):b.run(self.db,job,lambda:len(names)>=3)
+  self.assertEqual(len(set(names)),3)
+
  def test_pause_resume_and_review(self):
   job=b.create(self.db,self.cfg,100000);b.run(self.db,job,lambda:True);self.assertEqual(b.stats(self.db,job)['counts']['pending'],1)
   with patch.object(b.ai_service,'answer',return_value=('整理 [1]',[{'id':1}],{})) as answer:b.run(self.db,job);self.assertEqual(answer.call_count,1)

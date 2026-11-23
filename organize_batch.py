@@ -8,7 +8,8 @@ QUESTION='請整理此文件片段中記載的產品、功能、操作步驟與�
 def connect(path):
     db=core.connect(str(path))
     db.executescript('''CREATE TABLE IF NOT EXISTS organize_jobs(id TEXT PRIMARY KEY, config TEXT NOT NULL, token_limit INTEGER NOT NULL, reserved INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS organize_items(id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES organize_jobs(id), document_id INTEGER NOT NULL, path TEXT NOT NULL, sha TEXT, size INTEGER, mtime INTEGER, locator TEXT NOT NULL, text TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, result TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', reserved INTEGER NOT NULL DEFAULT 0);''')
+    CREATE TABLE IF NOT EXISTS organize_items(id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES organize_jobs(id), document_id INTEGER NOT NULL, path TEXT NOT NULL, sha TEXT, size INTEGER, mtime INTEGER, locator TEXT NOT NULL, text TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, result TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', reserved INTEGER NOT NULL DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS organize_pending_lookup ON organize_items(job_id,state,document_id,id);''')
     return db
 
 def pack_csv_chunks(chunks,limit=3000):
@@ -43,10 +44,10 @@ def create(path,config,limit):
             for did,name,sha,size,mtime,status,ext,detail in rows:
                 chunks=db.execute('SELECT locator,text FROM chunks WHERE document_id=? ORDER BY id',(did,)).fetchall() if status=='indexed' else []
                 if chunks:
-                    if ext.lower()=='.csv': chunks=pack_csv_chunks(chunks)
+                    chunks=pack_csv_chunks(chunks)
                     for loc,body in chunks:
                         for pos in range(0,len(body),3000):
-                            db.execute("INSERT INTO organize_items(job_id,document_id,path,sha,size,mtime,locator,text,kind,state) VALUES(?,?,?,?,?,?,?,?,?,?)",(ident,did,name,sha,size,mtime,loc,body[pos:pos+3000],'csv_group' if ext.lower()=='.csv' else 'text','pending'))
+                            db.execute("INSERT INTO organize_items(job_id,document_id,path,sha,size,mtime,locator,text,kind,state) VALUES(?,?,?,?,?,?,?,?,?,?)",(ident,did,name,sha,size,mtime,loc,body[pos:pos+3000],'csv_group' if ext.lower()=='.csv' else 'text_group','pending'))
                 else:
                     kind='ocr' if status=='indexed' and ext.lower()=='.pdf' and sha else 'unavailable'
                     state='pending' if kind=='ocr' else 'skipped'
@@ -82,9 +83,9 @@ def set_limit(path,job,value):
             db.execute('UPDATE organize_jobs SET token_limit=? WHERE id=?',(value,job))
     finally:db.close()
 
-def compact_pending_csv(db,job):
+def compact_pending_text(db,job):
     # Transaction owned by caller; only unprocessed legacy rows are merged.
-    docs=db.execute("SELECT DISTINCT i.document_id FROM organize_items i JOIN documents d ON d.id=i.document_id WHERE i.job_id=? AND i.state='pending' AND i.kind='text' AND lower(d.extension)='.csv'",(job,)).fetchall()
+    docs=db.execute("SELECT DISTINCT i.document_id FROM organize_items i JOIN documents d ON d.id=i.document_id WHERE i.job_id=? AND i.state='pending' AND i.kind='text'",(job,)).fetchall()
     for (did,) in docs:
         rows=db.execute("SELECT id,path,sha,size,mtime,locator,text FROM organize_items WHERE job_id=? AND document_id=? AND state='pending' AND kind='text' ORDER BY id",(job,did)).fetchall()
         if not rows:continue
@@ -93,7 +94,10 @@ def compact_pending_csv(db,job):
         if any(tuple(r[1:5])!=meta for r in rows):continue
         packed=pack_csv_chunks([(r[5],r[6]) for r in rows])
         db.executemany('DELETE FROM organize_items WHERE id=?',[(r[0],) for r in rows])
-        db.executemany("INSERT INTO organize_items(job_id,document_id,path,sha,size,mtime,locator,text,kind,state) VALUES(?,?,?,?,?,?,?,?,'csv_group','pending')",[(job,did,*meta,loc,text) for loc,text in packed])
+        db.executemany("INSERT INTO organize_items(job_id,document_id,path,sha,size,mtime,locator,text,kind,state) VALUES(?,?,?,?,?,?,?,?,'text_group','pending')",[(job,did,*meta,loc,text) for loc,text in packed])
+
+def compact_pending_csv(db,job):
+    return compact_pending_text(db,job)
 
 def retry_failed(path,job):
     db=connect(path)
@@ -124,12 +128,16 @@ def run(path,job,cancelled=lambda:False,progress=lambda x:None):
         config=json.loads(row[0]);limit=row[1]
         if ai_ui.read_config(Path(path).parent/'ai-settings.json')!=config: raise ValueError('AI 設定已變更；請建立新工作，避免混用模型。')
         if db.execute("SELECT count(*) FROM organize_items WHERE job_id=? AND state='unknown'",(job,)).fetchone()[0]: raise ValueError('有中斷後用量未知的項目；請先人工檢查，不能自動重試。')
-        compact_pending_csv(db,job)
+        progress('正在整理既有佇列，保留已完成草稿…')
+        compact_pending_text(db,job)
         db.execute("UPDATE organize_jobs SET state='running' WHERE id=?",(job,));db.commit()
+        previous_doc=0
         while not cancelled():
-            item=db.execute("SELECT id,path,sha,size,mtime,locator,text,kind FROM organize_items WHERE job_id=? AND state='pending' ORDER BY id LIMIT 1",(job,)).fetchone()
+            query="SELECT id,path,sha,size,mtime,locator,text,kind,document_id FROM organize_items WHERE job_id=? AND state='pending' "
+            item=db.execute(query+"AND document_id>? ORDER BY document_id,id LIMIT 1",(job,previous_doc)).fetchone()
+            if not item: item=db.execute(query+"ORDER BY document_id,id LIMIT 1",(job,)).fetchone()
             if not item: break
-            ident,name,sha,size,mtime,loc,body,kind=item
+            ident,name,sha,size,mtime,loc,body,kind,previous_doc=item
             source={'id':1,'path':name,'sha256':sha,'size':size,'mtime_ns':mtime,'locator':loc,'excerpt':body,'kind':'來源文件（待確認）'}
             if ai_service.source_state(source):
                 with db: db.execute("UPDATE organize_items SET state='failed',detail='來源已變更或無法讀取，請重新掃描。' WHERE id=?",(ident,))
