@@ -236,6 +236,58 @@ def test_connection(provider,key=None,base='http://127.0.0.1:11434/v1',network_e
     except urllib.error.URLError: raise RuntimeError('無法連接服務，請檢查網路或本地服務') from None
     return len(parsed['data'])
 
+def _local_segment_input(question,sources):
+    """Select verbatim sentences and neighbours; segment IDs are request-scoped."""
+    segments={}; packed=[]; next_id=1
+    normalized=question.lower().replace('全畫面','全螢幕').replace('全画面','全屏幕')
+    terms=[]
+    for token in re.findall(r'[A-Za-z0-9][A-Za-z0-9._+-]*|[\u3400-\u9fff]+',normalized):
+        if re.fullmatch(r'[\u3400-\u9fff]+',token):
+            terms.extend(token[i:i+2] for i in range(len(token)-1) if token[i:i+2] not in {'如何','怎麼','什么','什麼','可以','是否','請問','閱讀','讀器','阅读','读器'})
+        elif len(token)>=3 and token not in {'app'}: terms.append(token)
+    terms=list(dict.fromkeys(v.lower() for term in terms for v in core.chinese_variants(term)))[:60]
+    for source in sources:
+        excerpt=source['excerpt']; pieces=[]; seen=set()
+        for match in re.finditer(r'[^。！？!?；;\n]+[。！？!?；;]?|[。！？!?；;]',excerpt):
+            raw=match.group()
+            for offset in range(0,len(raw),300):
+                part=raw[offset:offset+300]
+                if not part.strip() or part.strip() in seen: continue
+                seen.add(part.strip()); pieces.append(part)
+        def score(i):
+            text=pieces[i].lower().replace('全畫面','全螢幕').replace('全画面','全屏幕')
+            return sum(min(len(term),6) for term in terms if term in text)
+        ranked=sorted(range(len(pieces)),key=lambda i:(-score(i),i))
+        chosen=set(); length=0
+        for i in ranked:
+            if len(chosen)>=6: break
+            if length+len(pieces[i])>900: continue
+            chosen.add(i); length+=len(pieces[i])
+            if score(i)>0:
+                for neighbour in (i-1,i+1):
+                    if 0<=neighbour<len(pieces) and neighbour not in chosen and len(chosen)<6 and length+len(pieces[neighbour])<=900:
+                        chosen.add(neighbour); length+=len(pieces[neighbour])
+        selected=[]
+        for i in sorted(chosen):
+            quote=pieces[i]; segments[next_id]=(source['id'],quote)
+            selected.append({'segment_id':next_id,'text':quote}); next_id+=1
+        item={'id':source['id'],'kind':source.get('kind','來源文件（來源可信度未確認）'),'segments':selected}
+        if source.get('path'): item['document_name']=Path(source['path']).name
+        packed.append(item)
+    return json.dumps({'question':question,'sources':packed},ensure_ascii=False),segments
+
+
+def _checked_segment_evidence(raw,segments):
+    parsed=json.loads(raw); body=parsed['answer']; evidence_ids=parsed['evidence_ids']
+    if not isinstance(body,str) or not body.strip(): raise ValueError()
+    if not isinstance(evidence_ids,list) or not evidence_ids or len(evidence_ids)>12: raise ValueError()
+    if any(type(i) is not int or i not in segments for i in evidence_ids): raise ValueError()
+    quotes=[segments[i] for i in dict.fromkeys(evidence_ids)]
+    ids=list(dict.fromkeys(ident for ident,_ in quotes))
+    if 'citations' in parsed and (not isinstance(parsed['citations'],list) or any(type(i) is not int for i in parsed['citations']) or set(parsed['citations'])!=set(ids)): raise ValueError()
+    if not {int(n) for n in re.findall(r'\[(\d+)\]',body)}.issubset(set(ids)): raise ValueError()
+    return body.strip(),ids,quotes
+
 class EvidenceError(RuntimeError):
     """A model answer could not be tied to exact source text."""
 
@@ -304,19 +356,26 @@ def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434
             raise RuntimeError('內建本地 AI 尚未啟動，請先按「啟動內建本地 AI」。')
         payload={'model':model,'messages':[{'role':'system','content':INSTRUCTIONS},{'role':'user','content':content}],'max_tokens':int(max_tokens),'stream':False}
         if model==local_ai.MODEL:
-            payload['messages'][0]['content']+=' 回傳 JSON：answer 為完整回答，citations 為實際使用的來源 id 整數陣列；evidence 每項 source_id 和 quote 必須逐字複製對應 excerpt 的一小段原文，每個引用至少一項。不可改寫 quote。'
-            evidence_item={'type':'object','properties':{'source_id':{'type':'integer'},'quote':{'type':'string'}},'required':['source_id','quote'],'additionalProperties':False}
-            payload['response_format']={'type':'json_schema','schema':{'type':'object','properties':{'answer':{'type':'string'},'citations':{'type':'array','items':{'type':'integer'}},'evidence':{'type':'array','items':evidence_item}},'required':['answer','citations','evidence'],'additionalProperties':False}}
+            local_content,segments=_local_segment_input(question,sources)
+            payload['messages'][1]['content']=local_content
+            payload['messages'][0]['content']=INSTRUCTIONS.replace('每項重要事實後標註 [數字]，數字只能使用提供的來源 id。','回答中不要加來源編號。')
+            payload['messages'][0]['content']+=' 回傳 JSON：answer 是回答，evidence_ids 是支持回答的 segment_id 整數陣列，只能選輸入中存在的 segment_id。'
+            payload['response_format']={'type':'json_schema','schema':{'type':'object','properties':{'answer':{'type':'string'},'evidence_ids':{'type':'array','items':{'type':'integer'}}},'required':['answer','evidence_ids'],'additionalProperties':False}}
             payload['temperature']=0
         response=post(local_endpoint(base),{'Content-Type':'application/json'},payload)
         choices=response.get('choices') or []; text=(choices[0].get('message',{}).get('content') or '').strip() if choices else ''
         if model==local_ai.MODEL:
             for attempt in range(2):
                 try:
-                    body,ids,quotes=_checked_evidence(text,sources); break
+                    parsed=json.loads(text)
+                    if 'evidence_ids' in parsed: body,ids,quotes=_checked_segment_evidence(text,segments)
+                    else:
+                        body,ids,quotes=_checked_evidence(text,sources)
+                        if any(not any(ident==sid and quote in selected for sid,selected in segments.values()) for ident,quote in quotes): raise ValueError()
+                    break
                 except (ValueError,TypeError,KeyError,AttributeError):
                     if attempt: raise EvidenceError('本地模型未提供可核對的來源原文；請重試、提高輸出上限或查看來源。') from None
-                    payload['messages'][0]['content']+=' 請確認 evidence 的每個 quote 是相應 excerpt 中連續、逐字的原文，且各引用都有 quote。'
+                    payload['messages'][0]['content']+=' 請從輸入的 segment_id 選取存在且相關的數字放入 evidence_ids。'
                     response=post(local_endpoint(base),{'Content-Type':'application/json'},payload)
                     choices=response.get('choices') or []; text=(choices[0].get('message',{}).get('content') or '').strip() if choices else ''
             missing=_missing_operation_markers(body,quotes,question,sources)
@@ -332,5 +391,5 @@ def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434
     if not cited or not cited.issubset(valid):
         raise RuntimeError('模型未提供有效來源編號，無法安全顯示回答；請換個問題或重試')
     if provider=='local' and model==local_ai.MODEL:
-        text+='\n\n供核對的來源片段文字（可能是 OCR 或 AI 衍生內容）：\n'+'\n'.join(f'[{ident}] 「{quote}」' for ident,quote in quotes)
+        text+='\n\n供核對的來源片段文字（已對照原文；回答各項敘述仍需人工核對，來源可能是 OCR 或 AI 衍生內容）：\n'+'\n'.join(f'[{ident}] 「{quote}」' for ident,quote in quotes)
     return text,[s for s in sources if s['id'] in cited],usage

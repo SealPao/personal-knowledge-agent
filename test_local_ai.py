@@ -99,6 +99,39 @@ class LocalModelTests(unittest.TestCase):
             local_ai.download(lambda done,total:progress.append((done,total)),root=root,phase=phases.append)
             self.assertIn('驗證已存在的模型檔',phases)
             self.assertIn((0,4),progress); self.assertIn((4,4),progress)
+    def test_segment_evidence_rejects_unknown_or_wrong_source(self):
+        sources=[{'id':1,'excerpt':'進入系統設定後點選畫面。'}, {'id':2,'excerpt':'按下返回鍵。'}]
+        content,segments=ai_service._local_segment_input('如何設定畫面',sources)
+        self.assertEqual(json.loads(content)['sources'][0]['segments'][0]['text'],sources[0]['excerpt'])
+        def raw(ids,evidence): return json.dumps({'answer':'設定 [1]','citations':ids,'evidence_ids':evidence})
+        with self.assertRaises(ValueError): ai_service._checked_segment_evidence(raw([1],[999]),segments)
+        with self.assertRaises(ValueError): ai_service._checked_segment_evidence(raw([1],[2]),segments)
+        body,ids,quotes=ai_service._checked_segment_evidence(raw([1],[1]),segments)
+        self.assertEqual(quotes,[(1,sources[0]['excerpt'])]); self.assertEqual(ids,[1])
+    def test_local_segments_limit_context_without_modifying_originals(self):
+        original='前言'*400+'亮度設定，請選擇亮度。'+'後記'*400
+        sources=[{'id':1,'excerpt':original}]
+        content,segments=ai_service._local_segment_input('如何調整亮度設定',sources)
+        sent=''.join(quote for _,quote in segments.values())
+        self.assertLessEqual(len(sent),1200); self.assertIn('亮度設定',sent)
+        self.assertTrue(all(part in original for _,part in segments.values())); self.assertEqual(sources[0]['excerpt'],original)
+    def test_builtin_uses_segment_ids_without_recopying_quote(self):
+        sources=[{'id':1,'excerpt':'長按電源鍵，選擇關機。'}]; calls=[]
+        def post(url,headers,payload):
+            calls.append(payload)
+            content=json.dumps({'answer':'長按電源鍵，選擇關機 [1]','citations':[1],'evidence_ids':[1]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            text,refs,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
+        self.assertEqual(len(calls),1); self.assertEqual(refs,sources); self.assertIn(sources[0]['excerpt'],text)
+    def test_repeated_irrelevant_text_does_not_hide_relevant_steps(self):
+        noise='本文件介紹閱讀器設定與使用說明。'*35
+        original=noise+'BOOX 顯示設定：開啟應用程式最佳化，選擇全螢幕顯示。'+noise
+        content,segments=ai_service._local_segment_input('BOOX 閱讀器如何讓 APP 全畫面運作？',[{'id':1,'excerpt':original}])
+        texts=[text for _,text in segments.values()]
+        self.assertTrue(any('選擇全螢幕顯示' in text for text in texts))
+        self.assertEqual(sum('本文件介紹閱讀器設定與使用說明。'==t for t in texts),1)
+        self.assertTrue(all(t in original for t in texts)); self.assertLess(len(content),len(original))
     def test_auth_only_for_current_local_server(self):
         class Proc:
             def poll(self): return None
