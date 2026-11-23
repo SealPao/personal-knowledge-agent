@@ -50,7 +50,7 @@ class AIWindow(tk.Toplevel):
         super().__init__(master); self.title('AI 問答 · 私人知識助理'); self.geometry('1080x760'); self.minsize(850,620); self.configure(bg=BG)
         self.db=Path(db_path); self.config_path=self.db.parent/'ai-settings.json'; self.config=read_config(self.config_path)
         self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running(); self.answer_started=None; self.download_phase='準備下載'; self.history=[]; self.pending_question=''; self.last_details=''; self.last_answer=''; self.last_outcome='尚無問答'; self.return_to_main=False; self.clarify_question=''; self.last_unanswered_question=''
-        self.question=tk.StringVar(); self.hint=tk.StringVar(); self._set_hint()
+        self.question=tk.StringVar(); self.hint=tk.StringVar(); self.request_status=tk.StringVar(value='本次尚未呼叫 AI'); self._set_hint()
         head=tk.Frame(self,bg=BG); head.pack(fill='x',padx=25,pady=(20,12))
         lab(head,'與你的文件對話',bg=BG,font=(FONT,19,'bold')).pack(side='left')
         btn(head,'返回文件搜尋',self.close).pack(side='left',padx=12)
@@ -60,6 +60,7 @@ class AIWindow(tk.Toplevel):
         btn(head,'預算與用量',self.open_budget).pack(side='right',padx=8)
         btn(head,'用閱讀器找答案',self.open_device).pack(side='right')
         lab(self,textvariable=self.hint,bg=BG,fg=MUTED,anchor='w').pack(fill='x',padx=25)
+        lab(self,textvariable=self.request_status,bg=BG,fg=BLUE,anchor='w',font=(FONT,10,'bold')).pack(fill='x',padx=25)
         self.download_button=btn(self,'下載可選本地模型（約 15.6 GB）',self.download_model)
         self.download_button.pack(anchor='w',padx=25,pady=(5,0))
         self.model_info=tk.StringVar(); lab(self,textvariable=self.model_info,bg=BG,fg=MUTED,font=(FONT,9)).pack(anchor='w',padx=25)
@@ -113,7 +114,7 @@ class AIWindow(tk.Toplevel):
                 self.hint.set('目前 AI：內建本地模型 · '+('已啟動' if local_ai.headers_for(self.config['local_base'].rstrip('/')+'/models') else '未啟動'))
             else: self.hint.set('目前 AI：自訂本機服務（連線狀態以測試結果為準）')
         elif not self.config['network_enabled']: self.hint.set('目前 AI：OpenAI · 外網關閉，無法連線')
-        else: self.hint.set('目前 AI：OpenAI · 提問、近期對話及搜尋片段會傳送至 OpenAI，可能產生費用。')
+        else: self.hint.set('已選擇 OpenAI：'+self.config['openai_model']+' · 外網已開啟，實際呼叫狀態見下方。')
     def toggle_local(self):
         if self.starting_local:
             self.start_cancel.set(); self.local_button.configure(state='disabled'); self.status.set('正在取消本地 AI 啟動…'); return
@@ -208,7 +209,11 @@ class AIWindow(tk.Toplevel):
         def field(label,variable,masked=False):
             lab(f,label,font=(FONT,10,'bold')).pack(anchor='w',pady=(11,3))
             tk.Entry(f,textvariable=variable,font=(FONT,10),show='•' if masked else '',relief='solid',bd=1).pack(fill='x',ipady=4)
-        field('OpenAI 模型',om); field('OpenAI API Key（留空代表不更換）',key,True)
+        lab(f,'OpenAI 模型（可選或自行輸入）',font=(FONT,10,'bold')).pack(anchor='w',pady=(11,3))
+        model_menu=ttk.Combobox(f,textvariable=om,values=[om.get()],state='normal',font=(FONT,10))
+        model_menu.pack(fill='x',ipady=4)
+        lab(f,'按「測試連線並載入模型」更新選單；顯示的模型不保證支援問答。',fg=MUTED,font=(FONT,9)).pack(anchor='w')
+        field('OpenAI API Key（留空代表不更換）',key,True)
         key_status=tk.StringVar()
         try: key_status.set('已儲存憑證' if svc.load_key() else '尚未儲存憑證')
         except Exception: key_status.set('無法讀取 Windows 憑證管理員')
@@ -240,26 +245,33 @@ class AIWindow(tk.Toplevel):
             def safe_work():
                 try:
                     candidate=typed or (svc.load_key() if mode=='openai' else None)
-                    count=svc.test_connection(mode,candidate,addr,network_enabled=allow)
-                    self.events.put(('connection_test',(True,f'服務已連線，回傳 {count} 個可見模型；實際模型權限仍需以問答確認。')))
-                except Exception as e: self.events.put(('connection_test',(False,str(e))))
+                    models=svc.list_models(mode,candidate,addr,network_enabled=allow)
+                    self.events.put(('connection_models',(w,model_menu,mode,models,None)))
+                except Exception as e: self.events.put(('connection_models',(w,model_menu,mode,[],str(e))))
             threading.Thread(target=safe_work,daemon=True).start()
-        btn(actions,'測試連線',test).pack(side='right',padx=10)
+        btn(actions,'測試連線並載入模型',test).pack(side='right',padx=10)
 
     def prepare(self):
         if self.busy: return
         self.config=read_config(self.config_path); self._set_hint()
+        self.request_status.set('本次尚未呼叫 AI；正在準備問題')
         q=self.question.get().strip()
         if not q or len(q)>svc.MAX_QUESTION: messagebox.showinfo('請輸入問題','問題不可為空，最多 2000 字。',parent=self); return
+        if re.search(r'(你|您|目前|現在|现在|使用).{0,12}(哪|什麼|什么|甚麼|哪个).{0,8}(模型|model)|(哪|什麼|什么|哪个).{0,8}(模型|model).{0,8}(你|目前|現在|现在|使用)',q,re.I):
+            if self.config['provider']=='openai':
+                reply='目前設定使用 OpenAI 的 '+self.config['openai_model']+'。'+('外網已開啟；只有實際送出問答後，才能確認模型可用。' if self.config['network_enabled'] else '外網目前關閉，無法呼叫 OpenAI；請到 AI 設定開啟並儲存。')
+            else:
+                reply='目前設定使用本地模型：'+(self.config['local_model'] or '尚未設定')+'。是否可用需以實際連線或問答確認。'
+            self._append_chat('你',q); self._append_chat('助理',reply); self.history.append({'question':q,'answer':reply}); self.question.set(''); self.request_status.set('本次由 APP 讀取設定回答，未呼叫 AI'); self.status.set('可以繼續提問。'); return
         if re.search(r'^(你|您)(可以|能|會|会)(回答|做|幫|帮|協助|协助).{0,10}[?？]?$|^(你|您)(有什麼|有什么)功能[?？]?$',q):
-            self._append_chat('你',q); reply='我可以協助搜尋已匯入的文件、整理操作步驟並附上來源，也可以接著上一個問題追問。你可以直接問我產品、機型或操作問題。'; self._append_chat('助理',reply); self.history.append({'question':q,'answer':reply}); self.question.set(''); self.status.set('可以繼續提問。'); return
+            self._append_chat('你',q); reply='我可以協助搜尋已匯入的文件、整理操作步驟並附上來源，也可以接著上一個問題追問。你可以直接問我產品、機型或操作問題。'; self._append_chat('助理',reply); self.history.append({'question':q,'answer':reply}); self.question.set(''); self.request_status.set('本次由 APP 直接回覆，未呼叫 AI'); self.status.set('可以繼續提問。'); return
         if q.strip(' ！!？?。') in ('你好','您好','嗨','哈囉','哈啰'):
-            reply='你好！想查詢哪個產品或操作問題？'; self._append_chat('你',q); self._append_chat('助理',reply); self.history.append({'question':q,'answer':reply}); self.question.set(''); self.status.set('可以繼續提問。'); return
+            reply='你好！想查詢哪個產品或操作問題？'; self._append_chat('你',q); self._append_chat('助理',reply); self.history.append({'question':q,'answer':reply}); self.question.set(''); self.request_status.set('本次由 APP 直接回覆，未呼叫 AI'); self.status.set('可以繼續提問。'); return
         if self.config['provider']=='local' and not self.config['local_model']:
             messagebox.showinfo('請設定本地模型','請先在 AI 設定填入本地模型名稱。',parent=self); return
         if self.config['provider']=='openai':
             if not self.config['network_enabled']:
-                messagebox.showinfo('外網存取已關閉','若要使用 OpenAI，請先在 AI 設定開啟外網存取。',parent=self); return
+                self.request_status.set('本次未呼叫 OpenAI：外網存取關閉'); messagebox.showinfo('外網存取已關閉','若要使用 OpenAI，請先在 AI 設定開啟外網存取。',parent=self); return
             try: exists=bool(svc.load_key())
             except Exception as e: messagebox.showerror('無法讀取 Key',str(e),parent=self); return
             if not exists: messagebox.showinfo('請設定 API Key','請先在 AI 設定儲存 OpenAI API Key。',parent=self); return
@@ -341,6 +353,7 @@ class AIWindow(tk.Toplevel):
                 key=svc.load_key() if config['provider']=='openai' else None
                 context=svc.bounded_history(getattr(self,'history',[]))
                 if config['provider']=='openai': ticket=budget.reserve(self.db,q,sources,config['openai_model'],config['max_tokens'],extra_input_tokens=len(json.dumps(context,ensure_ascii=False).encode('utf8'))+64)
+                self.events.put(('requesting',config['provider']))
                 result=svc.answer(q,sources,config['provider'],config['openai_model'] if config['provider']=='openai' else config['local_model'],key,config['local_base'],config['max_tokens'],network_enabled=config['network_enabled'],history=context)
                 if ticket: budget.finish(self.db,ticket,result[2])
                 if not result[1]: self.events.put(('unverified',sources))
@@ -358,11 +371,13 @@ class AIWindow(tk.Toplevel):
         try:
             while True:
                 kind,value=self.events.get_nowait()
-                if kind=='web_error': self._append_chat('助理','網路搜尋未完成：'+value+'。本次若有本地資料，仍會嘗試使用。')
+                if kind=='requesting':
+                    self.request_status.set('正在呼叫 '+('OpenAI：'+self.config['openai_model'] if value=='openai' else '本地 AI')+'；等待回應中')
+                elif kind=='web_error': self._append_chat('助理','網路搜尋未完成：'+value+'。本次若有本地資料，仍會嘗試使用。')
                 elif kind=='retrieved':
                     q,sources,approved,review=value
                     if not sources:
-                        self.last_outcome='搜尋無可用來源'; self._set_busy(False)
+                        self.request_status.set('本次未呼叫 AI：找不到可用來源'); self.last_outcome='搜尋無可用來源'; self._set_busy(False)
                         model=svc.model_identifiers(q); self.last_unanswered_question=q
                         supplemented=q.split('補充品牌或機型：',1)[1].strip() if '補充品牌或機型：' in q else ''
                         brand_reply=re.sub(r'(?<![a-z0-9])[a-z][a-z0-9-]*\s*\d[a-z0-9-]*(?![a-z0-9])',' ',supplemented,flags=re.I)
@@ -380,9 +395,9 @@ class AIWindow(tk.Toplevel):
                         self.status.set('資料不足；可開啟網路搜尋後重試。' if model and known_brand else '等待你補充資訊。')
                     elif review: self.preview(q,sources)
                     else: self.send(None,q,sources,approved)
-                elif kind=='error': self.last_outcome='處理錯誤'; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._append_chat('助理','無法完成：'+value); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
+                elif kind=='error': self.request_status.set('本次未完成 AI 回答；請查看錯誤訊息'); self.last_outcome='處理錯誤'; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._append_chat('助理','無法完成：'+value); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
                 elif kind=='unverified':
-                    self.last_outcome='來源不足或回答未通過核對'; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.sources_by_row=value
+                    self.request_status.set('AI 已回應，但來源核對未通過：'+self.answer_backend); self.last_outcome='來源不足或回答未通過核對'; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.sources_by_row=value
                     if re.search(r'pdf',self.pending_question,re.I) and not svc.model_identifiers(self.pending_question) and not re.search(r'boox|kobo|pubook|mooink|hyread|bigme|supernote',self.pending_question,re.I):
                         self.clarify_question=self.pending_question; self._append_chat('助理','PDF 的頁面縮放與文字重新排版是不同功能，是否可調整字體也取決於 PDF 和閱讀 APP。請問你使用哪一台閱讀器及哪個閱讀 APP？')
                     else:
@@ -392,6 +407,7 @@ class AIWindow(tk.Toplevel):
                     if value: self.cites.selection_set('0'); self.source_select()
                     self.status.set('來源核對未通過；右側顯示搜尋到的候選來源。')
                 elif kind=='answer':
+                    self.request_status.set('本次回答由 '+self.answer_backend+' 產生；請核對來源')
                     self.last_outcome='已產生回答（需人工核對）'
                     text,sources,usage=value; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.last_details=text; reply=self._compact_reply(text)
                     if not sources:
@@ -406,6 +422,15 @@ class AIWindow(tk.Toplevel):
                     if sources: self.cites.selection_set('0'); self.source_select()
                     stale=any(svc.source_state(source) for source in sources)
                     self.status.set('來源在回答期間變更或無法存取；請重新掃描並提問。' if stale else '回答已產生。請核對來源類型與片段；AI 回答可能有錯誤。' if sources else '資料不足，請補充資訊或重試。')
+                elif kind=='connection_models':
+                    window,menu,mode,models,error=value
+                    if not window.winfo_exists(): continue
+                    if error: messagebox.showerror('連線測試失敗',error,parent=window)
+                    else:
+                        if mode=='openai':
+                            chat_models=[m for m in models if m.startswith(('gpt-','o1','o3','o4','chatgpt-')) and not any(x in m for x in ('audio','realtime','transcribe','tts','embedding','moderation','image'))]
+                            menu.configure(values=chat_models)
+                        messagebox.showinfo('連線測試',f'服務已連線，取得 {len(models)} 個模型。OpenAI 模型選單已更新；能否回答仍須實際問答確認。' if mode=='openai' else f'本地服務已連線，取得 {len(models)} 個模型。',parent=window)
                 elif kind=='connection_test':
                     ok,description=value
                     if ok: messagebox.showinfo('連線測試',description,parent=self)

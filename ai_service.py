@@ -327,7 +327,7 @@ def local_endpoint(base):
         raise ValueError('本地 AI 位址只允許本機 http://localhost 或 127.0.0.1')
     return base.rstrip('/')+'/chat/completions'
 
-def test_connection(provider,key=None,base='http://127.0.0.1:11434/v1',network_enabled=False):
+def list_models(provider,key=None,base='http://127.0.0.1:11434/v1',network_enabled=False):
     if provider=='openai':
         if network_enabled is not True: raise ValueError('外網存取已關閉；請先在 AI 設定中開啟')
         if not key: raise ValueError('請先儲存 OpenAI API Key')
@@ -344,7 +344,10 @@ def test_connection(provider,key=None,base='http://127.0.0.1:11434/v1',network_e
             if not isinstance(parsed,dict) or not isinstance(parsed.get('data'),list): raise ValueError('服務回應格式不正確')
     except urllib.error.HTTPError as e: raise RuntimeError(f'服務回傳 HTTP {e.code}；請檢查憑證或權限') from None
     except urllib.error.URLError: raise RuntimeError('無法連接服務，請檢查網路或本地服務') from None
-    return len(parsed['data'])
+    return sorted({item['id'] for item in parsed['data'] if isinstance(item,dict) and isinstance(item.get('id'),str) and 0<len(item['id'])<=200})
+
+def test_connection(provider,key=None,base='http://127.0.0.1:11434/v1',network_enabled=False):
+    return len(list_models(provider,key,base,network_enabled))
 
 def _local_segment_input(question,sources,history=None):
     """Select verbatim sentences and neighbours; segment IDs are request-scoped."""
