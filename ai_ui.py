@@ -4,15 +4,17 @@ import queue
 import re
 import threading
 import time
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
 import ai_service as svc
 import budget
 import local_ai
+import web_search
 
 FONT='Microsoft JhengHei UI'; WHITE='#ffffff'; BG='#f1f5f9'; INK='#1b2c40'; MUTED='#64748b'; BLUE='#2563eb'
-DEFAULT={'provider':'openai','openai_model':'gpt-5.4-mini','local_model':'','local_base':'http://127.0.0.1:11434/v1','max_tokens':800,'network_enabled':False}
+DEFAULT={'provider':'openai','openai_model':'gpt-5.4-mini','local_model':'','local_base':'http://127.0.0.1:11434/v1','max_tokens':800,'network_enabled':False,'auto_start_local':True}
 
 def read_config(path):
     try:
@@ -20,13 +22,14 @@ def read_config(path):
         if not isinstance(data,dict): return dict(DEFAULT)
         result={**DEFAULT,**{k:v for k,v in data.items() if k in DEFAULT}}
         result['network_enabled']=data.get('network_enabled') is True
+        result['auto_start_local']=data.get('auto_start_local',True) is True
         return result
     except (OSError,ValueError,TypeError): return dict(DEFAULT)
 
 def write_config(path,config):
     path.parent.mkdir(parents=True,exist_ok=True)
     temp=path.with_suffix('.tmp')
-    with open(temp,'w',encoding='utf-8') as f: json.dump({k:config[k] for k in DEFAULT},f,ensure_ascii=False,indent=2)
+    with open(temp,'w',encoding='utf-8') as f: json.dump({k:config.get(k,DEFAULT[k]) for k in DEFAULT},f,ensure_ascii=False,indent=2)
     os.replace(temp,path)
 
 def lab(p,text='',**kw):
@@ -46,7 +49,7 @@ class AIWindow(tk.Toplevel):
     def __init__(self,master,db_path):
         super().__init__(master); self.title('AI 問答 · 私人知識助理'); self.geometry('1080x760'); self.minsize(850,620); self.configure(bg=BG)
         self.db=Path(db_path); self.config_path=self.db.parent/'ai-settings.json'; self.config=read_config(self.config_path)
-        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running(); self.answer_started=None; self.download_phase='準備下載'; self.history=[]; self.pending_question=''; self.last_details=''; self.return_to_main=False
+        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running(); self.answer_started=None; self.download_phase='準備下載'; self.history=[]; self.pending_question=''; self.last_details=''; self.return_to_main=False; self.clarify_question=''
         self.question=tk.StringVar(); self.hint=tk.StringVar(); self._set_hint()
         head=tk.Frame(self,bg=BG); head.pack(fill='x',padx=25,pady=(20,12))
         lab(head,'與你的文件對話',bg=BG,font=(FONT,19,'bold')).pack(side='left')
@@ -68,7 +71,9 @@ class AIWindow(tk.Toplevel):
         self.entry=tk.Entry(row,textvariable=self.question,font=(FONT,12),bd=0,highlightthickness=1,highlightbackground='#cbd5e1',highlightcolor=BLUE)
         self.entry.pack(side='left',fill='x',expand=True,ipady=8); self.entry.bind('<Return>',lambda e:self.prepare())
         self.ask_button=btn(row,'尋找資料並回答',self.prepare,True); self.ask_button.pack(side='left',padx=(10,0))
-        self.review_sources=tk.BooleanVar(value=False); tk.Checkbutton(card,text='回答前手動選擇來源（選用）',variable=self.review_sources,bg=WHITE,fg=MUTED,font=(FONT,9),anchor='w').pack(anchor='w',padx=15,pady=(0,8))
+        opts=tk.Frame(card,bg=WHITE); opts.pack(fill='x',padx=15,pady=(0,8))
+        self.review_sources=tk.BooleanVar(value=False); tk.Checkbutton(opts,text='回答前手動選擇來源',variable=self.review_sources,bg=WHITE,fg=MUTED,font=(FONT,9),anchor='w').pack(side='left')
+        self.web_enabled=tk.BooleanVar(value=False); tk.Checkbutton(opts,text='網路搜尋（問題會送到 DuckDuckGo）',variable=self.web_enabled,bg=WHITE,fg=MUTED,font=(FONT,9),anchor='w').pack(side='left',padx=12)
         bottom=tk.Frame(self,bg=BG); bottom.pack(side='bottom',fill='x',padx=25,pady=(0,15))
         self.status=tk.StringVar(value='回答會依本地搜尋結果產生，並標明來源。')
         lab(bottom,textvariable=self.status,bg=BG,fg=MUTED,anchor='w').pack(fill='x')
@@ -91,22 +96,33 @@ class AIWindow(tk.Toplevel):
         self.source_info=tk.Text(s,height=8,wrap='word',font=(FONT,9),fg=INK,bg='#f8fafc',bd=0,padx=10,pady=8)
         self.source_info.pack(fill='x',padx=12,pady=(5,8)); self.source_info.configure(state='disabled')
         btn(s,'開啟所選原始文件',self.open_source).pack(anchor='w',padx=12,pady=(0,14))
-        self.protocol('WM_DELETE_WINDOW',self.close); self.poll_id=self.after(150,self.poll)
+        self.protocol('WM_DELETE_WINDOW',self.close); self.poll_id=self.after(150,self.poll); self.after(250,self.restore_last_ai)
 
+    def restore_last_ai(self):
+        self.config=read_config(self.config_path)
+        if self.busy or local_ai.running() or self.config['provider']!='local' or self.config['local_model']!=local_ai.MODEL or not self.config['auto_start_local']: return
+        try: info=local_ai.model_status()
+        except OSError: self.status.set('無法讀取本地模型，請檢查模型檔案。'); return
+        if not info['ready'] or not info['runtime']:
+            self.status.set('上次的本地模型未就緒；請檢查模型檔和執行程式。'); return
+        self.toggle_local()
     def _set_hint(self):
         if self.config['provider']=='local':
             if self.config['local_model']==local_ai.MODEL:
-                self.hint.set('本地 AI 模式：'+('內建模型運行中。' if local_ai.headers_for(self.config['local_base'].rstrip('/')+'/models') else '內建模型尚未啟動。'))
-            else: self.hint.set('本地 AI 模式：使用自行設定的本機模型服務。')
-        elif not self.config['network_enabled']: self.hint.set('外網存取已關閉。OpenAI 無法連線；本地模型仍可使用。')
-        else: self.hint.set('OpenAI 模式：提問、近期對話及搜尋片段會傳送至 OpenAI，可能產生費用。')
+                self.hint.set('目前 AI：內建本地模型 · '+('已啟動' if local_ai.headers_for(self.config['local_base'].rstrip('/')+'/models') else '未啟動'))
+            else: self.hint.set('目前 AI：自訂本機服務（連線狀態以測試結果為準）')
+        elif not self.config['network_enabled']: self.hint.set('目前 AI：OpenAI · 外網關閉，無法連線')
+        else: self.hint.set('目前 AI：OpenAI · 提問、近期對話及搜尋片段會傳送至 OpenAI，可能產生費用。')
     def toggle_local(self):
         if self.starting_local:
             self.start_cancel.set(); self.local_button.configure(state='disabled'); self.status.set('正在取消本地 AI 啟動…'); return
         if self.busy: return
         if local_ai.running():
-            local_ai.stop(); self.local_button.configure(text='啟動內建本地 AI'); self._set_hint(); self.status.set('內建本地 AI 已關閉。'); return
-        self.start_cancel.clear(); self.starting_local=True; self._set_busy(True); self.local_button.configure(text='取消啟動本地 AI'); self.status.set('正在啟動本地模型，首次載入可能需要數分鐘…')
+            local_ai.stop(); self.config=read_config(self.config_path); self.config['auto_start_local']=False
+            try: write_config(self.config_path,self.config)
+            except OSError as e: self.status.set('已關閉模型，但無法儲存設定：'+str(e)); return
+            self.local_button.configure(text='啟動內建本地 AI'); self._set_hint(); self.refresh_model_info(); self.status.set('內建本地 AI 已關閉；下次不會自動啟動。'); return
+        self.start_cancel.clear(); self.starting_local=True; self._set_busy(True); self.local_button.configure(text='取消啟動本地 AI'); self.hint.set('目前 AI：內建本地模型 · 啟動中'); self.status.set('正在啟動本地模型，首次載入可能需要數分鐘…')
         def start():
             try:
                 try: result=local_ai.start(cancelled=self.start_cancel.is_set)
@@ -120,8 +136,8 @@ class AIWindow(tk.Toplevel):
         try:
             info=local_ai.model_status()
             if info['ready']:
-                text='本地模型已下載（依檔案大小判斷）；按「啟動內建本地 AI」開始使用。'
-                if not self.downloading: self.download_button.configure(text='驗證已下載的本地模型')
+                text='' if local_ai.running() else '本地模型已下載（依檔案大小判斷）。'
+                if not self.downloading: self.download_button.configure(text='模型管理／驗證')
             elif info['present']: text=f"模型下載進度：{info['present']/info['total']*100:.1f}%；可繼續下載。"
             else: text='尚未下載內建模型。'
             if not info['runtime']: text+=' 缺少本地執行程式。'
@@ -154,7 +170,7 @@ class AIWindow(tk.Toplevel):
         else: self.chat_body.add(self.source_panel,minsize=280,stretch='always'); self.source_visible=True
     def new_chat(self):
         if self.busy: return
-        self.history=[]; self.pending_question=''; self.last_details=''; self.sources_by_row=[]; self.cites.delete(*self.cites.get_children()); self._source_text('')
+        self.history=[]; self.pending_question=''; self.clarify_question=''; self.last_details=''; self.sources_by_row=[]; self.cites.delete(*self.cites.get_children()); self._source_text('')
         self._answer_text('已開始新對話。')
     def _append_chat(self,role,value):
         self.answer_box.configure(state='normal'); self.answer_box.insert('end','\n\n'+role+'：\n'+value); self.answer_box.see('end'); self.answer_box.configure(state='disabled')
@@ -177,8 +193,9 @@ class AIWindow(tk.Toplevel):
         f=tk.Frame(w,bg=WHITE); f.pack(fill='both',expand=True,padx=25,pady=20)
         lab(f,'AI 服務設定',font=(FONT,16,'bold')).pack(anchor='w')
         lab(f,'OpenAI 或本地模型可切換；不會自動下載模型。',fg=MUTED).pack(anchor='w',pady=(4,15))
-        provider=tk.StringVar(value=self.config['provider']); om=tk.StringVar(value=self.config['openai_model']); lm=tk.StringVar(value=self.config['local_model']); base=tk.StringVar(value=self.config['local_base']); maximum=tk.StringVar(value=str(self.config['max_tokens'])); key=tk.StringVar(); network=tk.BooleanVar(value=bool(self.config['network_enabled']))
+        provider=tk.StringVar(value=self.config['provider']); om=tk.StringVar(value=self.config['openai_model']); lm=tk.StringVar(value=self.config['local_model']); base=tk.StringVar(value=self.config['local_base']); maximum=tk.StringVar(value=str(self.config['max_tokens'])); key=tk.StringVar(); network=tk.BooleanVar(value=bool(self.config['network_enabled'])); auto_local=tk.BooleanVar(value=self.config['auto_start_local'])
         tk.Checkbutton(f,text='允許 AI 連接外網（關閉時仍可使用本機模型）',variable=network,bg=WHITE,fg=INK,font=(FONT,10,'bold'),anchor='w').pack(fill='x',pady=(0,4))
+        tk.Checkbutton(f,text='使用內建模型時自動啟動上次的模型',variable=auto_local,bg=WHITE,fg=INK,font=(FONT,9),anchor='w').pack(fill='x')
         mode=tk.Frame(f,bg=WHITE); mode.pack(fill='x')
         tk.Radiobutton(mode,text='OpenAI',variable=provider,value='openai',bg=WHITE,font=(FONT,10)).pack(side='left')
         tk.Radiobutton(mode,text='本地 AI（OpenAI 相容服務）',variable=provider,value='local',bg=WHITE,font=(FONT,10)).pack(side='left')
@@ -205,7 +222,7 @@ class AIWindow(tk.Toplevel):
                 svc.local_endpoint(base.get())
                 if provider.get()=='local' and not lm.get().strip(): raise ValueError('使用本地 AI 時請填寫本地模型名稱')
                 if key.get().strip(): svc.save_key(key.get())
-                conf={'provider':provider.get(),'openai_model':om.get().strip(),'local_model':lm.get().strip(),'local_base':base.get().strip(),'max_tokens':limit,'network_enabled':network.get()}
+                conf={'provider':provider.get(),'openai_model':om.get().strip(),'local_model':lm.get().strip(),'local_base':base.get().strip(),'max_tokens':limit,'network_enabled':network.get(),'auto_start_local':auto_local.get()}
                 write_config(self.config_path,conf); self.config=conf; self._set_hint(); key.set(''); w.destroy()
                 if hasattr(self.master,'refresh_network'): self.master.refresh_network()
             except Exception as e: messagebox.showerror('無法儲存設定',str(e),parent=w)
@@ -240,11 +257,24 @@ class AIWindow(tk.Toplevel):
             try: exists=bool(svc.load_key())
             except Exception as e: messagebox.showerror('無法讀取 Key',str(e),parent=self); return
             if not exists: messagebox.showinfo('請設定 API Key','請先在 AI 設定儲存 OpenAI API Key。',parent=self); return
-        self.pending_question=q; self.last_details=''; self._append_chat('你',q); self.question.set(''); self.cites.delete(*self.cites.get_children()); self.sources_by_row=[]; self._source_text('')
-        self._set_busy(True); self.status.set('正在本地搜尋相關文件…'); approved=dict(self.config); review=self.review_sources.get()
+        visible_q=q
+        if self.clarify_question and len(q)<=60 and not re.search(r'[?？]|(怎麼|如何|怎麽|哪裡|为何|為什麼)',q):
+            q=(self.clarify_question+'；補充品牌或機型：'+q)[:svc.MAX_QUESTION]
+        self.clarify_question=''
+        self.pending_question=q; self.last_details=''; self._append_chat('你',visible_q); self.question.set(''); self.cites.delete(*self.cites.get_children()); self.sources_by_row=[]; self._source_text('')
+        self._set_busy(True); self.status.set('正在本地搜尋相關文件…'); approved=dict(self.config); review=self.review_sources.get(); use_web=self.web_enabled.get()
+        if use_web: self.status.set('正在本地搜尋，並將問題傳送至 DuckDuckGo…')
         def work():
             try:
                 sources=svc.retrieve(str(self.db),svc.search_question(q,self.history))
+                if use_web:
+                    try:
+                        found=web_search.search(q)
+                        models=svc.model_identifiers(q)
+                        if models: found=[item for item in found if all(svc.matches_model(item['title']+' '+item['snippet'],term) for term in models)]
+                        if not found: self.events.put(('web_error','網路摘要沒有明確匹配指定型號'))
+                        sources=sources[:3]+web_search.to_sources(found,start=min(len(sources),3)+1)
+                    except Exception as e: self.events.put(('web_error',str(e)))
                 self.events.put(('retrieved',(q,sources,approved,review)))
             except Exception as e: self.events.put(('error',str(e)))
         threading.Thread(target=work,daemon=True).start()
@@ -320,10 +350,17 @@ class AIWindow(tk.Toplevel):
         try:
             while True:
                 kind,value=self.events.get_nowait()
-                if kind=='retrieved':
+                if kind=='web_error': self._append_chat('助理','網路搜尋未完成：'+value+'。本次若有本地資料，仍會嘗試使用。')
+                elif kind=='retrieved':
                     q,sources,approved,review=value
-                    if review: self.preview(q,sources)
-                    elif not sources: self._set_busy(False); self._append_chat('助理','找不到明確符合的資料，無法確認答案。請確認機型與文件是否已匯入，或換個問法。'); self.status.set('沒有找到可用來源。')
+                    if not sources:
+                        self._set_busy(False)
+                        model=svc.model_identifiers(q)
+                        if model:
+                            self.clarify_question=q; self._append_chat('助理',f'我目前找不到能確認「{model[0]}」的資料。請問它是哪個品牌和完整型號？如果方便，也可以告訴我韌體版本。')
+                        else: self._append_chat('助理','找不到明確符合的資料。你能提供品牌、完整型號，或補充想操作的功能嗎？')
+                        self.status.set('等待你補充資訊。')
+                    elif review: self.preview(q,sources)
                     else: self.send(None,q,sources,approved)
                 elif kind=='error': self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._append_chat('助理','無法完成：'+value); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
                 elif kind=='unverified':
@@ -336,7 +373,7 @@ class AIWindow(tk.Toplevel):
                 elif kind=='answer':
                     text,sources,usage=value; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.last_details=text; reply=self._compact_reply(text); self._append_chat('助理',reply); self.history.append({'question':self.pending_question,'answer':reply}); self.history=self.history[-10:]; self.sources_by_row=sources
                     self.cites.delete(*self.cites.get_children()); self._source_text('')
-                    for i,s in enumerate(sources): self.cites.insert('','end',iid=str(i),values=(f'[{s["id"]}]',Path(s['path']).name,s['locator']))
+                    for i,s in enumerate(sources): self.cites.insert('','end',iid=str(i),values=(f'[{s["id"]}]',s.get('title') or Path(s['path']).name,s['locator']))
                     if sources: self.cites.selection_set('0'); self.source_select()
                     stale=any(svc.source_state(source) for source in sources)
                     self.status.set('來源在回答期間變更或無法存取；請重新掃描並提問。' if stale else '回答已產生。請核對來源類型與片段；AI 回答可能有錯誤。')
@@ -351,12 +388,13 @@ class AIWindow(tk.Toplevel):
                     if ok and self.start_cancel.is_set():
                         local_ai.stop(); self.status.set('已取消啟動本地 AI。'); continue
                     if ok:
-                        base,model=result; self.config=read_config(self.config_path); self.config.update(provider='local',local_base=base,local_model=model)
+                        base,model=result; self.config=read_config(self.config_path); self.config.update(provider='local',local_base=base,local_model=model,auto_start_local=True)
                         try: write_config(self.config_path,self.config)
                         except Exception as e:
                             local_ai.stop(); self.status.set('無法保存設定：'+str(e)); continue
-                        self.local_button.configure(text='關閉內建本地 AI'); self._set_hint(); self.status.set('內建本地 AI 已啟動，可使用本地文件問答與支援圖片的閱讀器探索。')
+                        self.local_button.configure(text='關閉內建本地 AI'); self._set_hint(); self.refresh_model_info(); self.status.set('內建本地 AI 已啟動，可使用本地文件問答與支援圖片的閱讀器探索。')
                     else:
+                        self._set_hint(); self.refresh_model_info()
                         self.status.set(result if self.start_cancel.is_set() else '本地模型啟動失敗：'+result)
                         if not self.start_cancel.is_set(): messagebox.showerror('本地模型啟動失敗',result,parent=self)
                 elif kind=='download_phase':
@@ -391,6 +429,9 @@ class AIWindow(tk.Toplevel):
         if not selected: return
         source=self.sources_by_row[int(selected[0])]; state=svc.source_state(source)
         if state: messagebox.showwarning('來源目前無法開啟',state,parent=self); return
+        if source.get('kind')==web_search.KIND:
+            if not web_search.safe_public_url(source.get('url')): messagebox.showerror('網址無效','無法開啟此網路來源。',parent=self); return
+            webbrowser.open(source['url']); return
         try: os.startfile(source['path'])
         except OSError as e: messagebox.showerror('無法開啟來源',str(e),parent=self)
     def close(self):

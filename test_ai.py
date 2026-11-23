@@ -34,6 +34,17 @@ class AITests(unittest.TestCase):
         self.assertEqual(ai.retrieve(str(self.db),'BOOX palma3 要去哪裡調整前光？'),[])
         self.assertEqual(ai.retrieve(str(self.db),'BOOX palma 3 要去哪裡調整前光？'),[])
         self.assertTrue(ai.retrieve(str(self.db),'BOOX palma2 要去哪裡調整前光？'))
+    def test_short_model_go7_does_not_match_go70_or_other_model(self):
+        (self.source/'BOOX Go 70.md').write_text('# 刷新\nBOOX Go 70 在設定中調整刷新。',encoding='utf8')
+        (self.source/'Pubook 刷新.md').write_text('# 刷新\nPubook 在快捷選單調整刷新。',encoding='utf8')
+        core.scan(str(self.source),str(self.db))
+        self.assertEqual(ai.model_identifiers('我想知道怎麼調整 go7 的刷新'),['go7'])
+        self.assertEqual(ai.model_identifiers('Wi-Fi 2.4 如何連線'),[])
+        self.assertEqual(ai.retrieve(str(self.db),'我想知道怎麼調整 go7 的刷新'),[])
+        (self.source/'BOOX Go 7.md').write_text('# 刷新\nBOOX Go 7 在設定中調整刷新。',encoding='utf8')
+        core.scan(str(self.source),str(self.db))
+        refs=ai.retrieve(str(self.db),'我想知道怎麼調整 go7 的刷新')
+        self.assertTrue(refs); self.assertTrue(all('Go 7' in item['path'] for item in refs))
     def test_followup_context_bounded_and_not_document_evidence(self):
         history=[{'question':'BOOX palma3 前光在哪裡','answer':'之前的回答'}]
         self.assertIn('palma3',ai.search_question('那它的亮度呢？',history))
