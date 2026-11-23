@@ -49,7 +49,7 @@ class AIWindow(tk.Toplevel):
     def __init__(self,master,db_path):
         super().__init__(master); self.title('AI 問答 · 私人知識助理'); self.geometry('1080x760'); self.minsize(850,620); self.configure(bg=BG)
         self.db=Path(db_path); self.config_path=self.db.parent/'ai-settings.json'; self.config=read_config(self.config_path)
-        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running(); self.answer_started=None; self.download_phase='準備下載'; self.history=[]; self.pending_question=''; self.last_details=''; self.return_to_main=False; self.clarify_question=''; self.last_unanswered_question=''
+        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running(); self.answer_started=None; self.download_phase='準備下載'; self.history=[]; self.pending_question=''; self.last_details=''; self.last_answer=''; self.last_outcome='尚無問答'; self.return_to_main=False; self.clarify_question=''; self.last_unanswered_question=''
         self.question=tk.StringVar(); self.hint=tk.StringVar(); self._set_hint()
         head=tk.Frame(self,bg=BG); head.pack(fill='x',padx=25,pady=(20,12))
         lab(head,'與你的文件對話',bg=BG,font=(FONT,19,'bold')).pack(side='left')
@@ -85,6 +85,7 @@ class AIWindow(tk.Toplevel):
         lab(aheader,'對話',font=(FONT,12,'bold')).pack(side='left')
         btn(aheader,'顯示／隱藏來源',self.toggle_sources).pack(side='right')
         btn(aheader,'開始新對話',self.new_chat).pack(side='right',padx=6)
+        btn(aheader,'整理與匯出',self.open_organize).pack(side='right',padx=6)
         f=tk.Frame(a,bg=WHITE); f.pack(fill='both',expand=True,padx=16,pady=(0,16))
         self.answer_box=tk.Text(f,wrap='word',font=(FONT,11),fg=INK,bg=WHITE,bd=0,spacing3=7)
         sb=ttk.Scrollbar(f,command=self.answer_box.yview); self.answer_box.configure(yscrollcommand=sb.set); self.answer_box.pack(side='left',fill='both',expand=True); sb.pack(side='right',fill='y')
@@ -165,14 +166,19 @@ class AIWindow(tk.Toplevel):
     def open_device(self):
         import adb_ui
         adb_ui.DeviceWindow(self.master,self.db,self.question.get().strip())
+    def open_organize(self):
+        if self.busy: messagebox.showinfo('處理中','請等待目前問答完成。',parent=self); return
+        import organize_ui
+        organize_ui.OrganizeWindow(self,self.db,{'question':self.pending_question,'answer':self.last_answer,'outcome':self.last_outcome})
     def toggle_sources(self):
         if self.source_visible: self.chat_body.forget(self.source_panel); self.source_visible=False
         else: self.chat_body.add(self.source_panel,minsize=280,stretch='always'); self.source_visible=True
     def new_chat(self):
         if self.busy: return
-        self.history=[]; self.pending_question=''; self.clarify_question=''; self.last_unanswered_question=''; self.last_details=''; self.sources_by_row=[]; self.cites.delete(*self.cites.get_children()); self._source_text('')
+        self.history=[]; self.pending_question=''; self.clarify_question=''; self.last_unanswered_question=''; self.last_details=''; self.last_answer=''; self.last_outcome='尚無問答'; self.sources_by_row=[]; self.cites.delete(*self.cites.get_children()); self._source_text('')
         self._answer_text('已開始新對話。')
     def _append_chat(self,role,value):
+        if role=='助理': self.last_answer=value
         self.answer_box.configure(state='normal'); self.answer_box.insert('end','\n\n'+role+'：\n'+value); self.answer_box.see('end'); self.answer_box.configure(state='disabled')
     @staticmethod
     def _compact_reply(value):
@@ -263,7 +269,7 @@ class AIWindow(tk.Toplevel):
         if self.clarify_question and len(q)<=60 and not re.search(r'[?？]|(怎麼|如何|怎麽|哪裡|为何|為什麼)',q):
             q=(self.clarify_question+'；補充品牌或機型：'+q)[:svc.MAX_QUESTION]
         self.clarify_question=''
-        self.pending_question=q; self.last_details=''; self._append_chat('你',visible_q); self.question.set(''); self.cites.delete(*self.cites.get_children()); self.sources_by_row=[]; self._source_text('')
+        self.pending_question=q; self.last_outcome='處理中'; self.last_details=''; self._append_chat('你',visible_q); self.question.set(''); self.cites.delete(*self.cites.get_children()); self.sources_by_row=[]; self._source_text('')
         self._set_busy(True); self.status.set('正在本地搜尋相關文件…'); approved=dict(self.config); review=self.review_sources.get(); use_web=self.web_enabled.get()
         if use_web: self.status.set('正在本地搜尋，並將問題傳送至 DuckDuckGo…')
         def work():
@@ -356,7 +362,7 @@ class AIWindow(tk.Toplevel):
                 elif kind=='retrieved':
                     q,sources,approved,review=value
                     if not sources:
-                        self._set_busy(False)
+                        self.last_outcome='搜尋無可用來源'; self._set_busy(False)
                         model=svc.model_identifiers(q); self.last_unanswered_question=q
                         supplemented=q.split('補充品牌或機型：',1)[1].strip() if '補充品牌或機型：' in q else ''
                         brand_reply=re.sub(r'(?<![a-z0-9])[a-z][a-z0-9-]*\s*\d[a-z0-9-]*(?![a-z0-9])',' ',supplemented,flags=re.I)
@@ -374,9 +380,9 @@ class AIWindow(tk.Toplevel):
                         self.status.set('資料不足；可開啟網路搜尋後重試。' if model and known_brand else '等待你補充資訊。')
                     elif review: self.preview(q,sources)
                     else: self.send(None,q,sources,approved)
-                elif kind=='error': self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._append_chat('助理','無法完成：'+value); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
+                elif kind=='error': self.last_outcome='處理錯誤'; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._append_chat('助理','無法完成：'+value); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
                 elif kind=='unverified':
-                    self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.sources_by_row=value
+                    self.last_outcome='來源不足或回答未通過核對'; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.sources_by_row=value
                     if re.search(r'pdf',self.pending_question,re.I) and not svc.model_identifiers(self.pending_question) and not re.search(r'boox|kobo|pubook|mooink|hyread|bigme|supernote',self.pending_question,re.I):
                         self.clarify_question=self.pending_question; self._append_chat('助理','PDF 的頁面縮放與文字重新排版是不同功能，是否可調整字體也取決於 PDF 和閱讀 APP。請問你使用哪一台閱讀器及哪個閱讀 APP？')
                     else:
@@ -386,6 +392,7 @@ class AIWindow(tk.Toplevel):
                     if value: self.cites.selection_set('0'); self.source_select()
                     self.status.set('來源核對未通過；右側顯示搜尋到的候選來源。')
                 elif kind=='answer':
+                    self.last_outcome='已產生回答（需人工核對）'
                     text,sources,usage=value; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.last_details=text; reply=self._compact_reply(text)
                     if not sources:
                         self.last_unanswered_question=self.pending_question

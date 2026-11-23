@@ -70,6 +70,7 @@ class App(tk.Tk):
         label(sidebar,'●  文件搜尋',bg=NAVY,fg=WHITE,font=(FONT,11,'bold')).pack(anchor='w',padx=25)
         button(sidebar,'✦  AI 問答',self.open_ai,bg='#30445b',fg=WHITE).pack(fill='x',padx=20,pady=(15,0))
         button(sidebar,'▤  文件管理與編輯',self.open_documents,bg='#30445b',fg=WHITE).pack(fill='x',padx=20,pady=(6,0))
+        button(sidebar,'整理與匯出',self.open_organize,bg='#30445b',fg=WHITE).pack(fill='x',padx=20,pady=(6,0))
         button(sidebar,'選擇或匯入知識庫',self.library_options,bg='#30445b',fg=WHITE).pack(fill='x',padx=20,pady=(6,0))
         label(sidebar,'知識庫',bg=NAVY,fg='#9cb0c5',font=(FONT,9,'bold')).pack(anchor='w',padx=24,pady=(30,6))
         label(sidebar,textvariable=self.metrics,bg=NAVY,fg='#dbeafe',justify='left',wraplength=170).pack(anchor='w',padx=24)
@@ -153,6 +154,10 @@ class App(tk.Tk):
         if window is None or not window.winfo_exists():
             window=ai_ui.AIWindow(self,DB); window.return_to_main=True; self.ai_window=window
         self.withdraw(); window.deiconify(); window.lift()
+    def open_organize(self):
+        if not DB.exists(): messagebox.showinfo('尚未建立索引','請先掃描來源資料夾。'); return
+        import organize_ui
+        organize_ui.OrganizeWindow(self,DB)
     def open_documents(self):
         if not DB.exists(): messagebox.showinfo('尚未建立索引','請先掃描來源資料夾。'); return
         import document_ui
