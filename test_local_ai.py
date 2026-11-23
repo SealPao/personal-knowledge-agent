@@ -91,6 +91,14 @@ class LocalModelTests(unittest.TestCase):
             (root/'models'/'model.gggguf').write_bytes(b'ignored')
             (root/'models'/'model.gguf').write_bytes(b'abcdefgh'); (root/'models'/'vision.gguf').write_bytes(b'abcd')
             self.assertTrue(local_ai.model_status(root)['ready'])
+    def test_existing_model_verification_reports_progress(self):
+        files=(('model.gguf',4,hashlib.sha256(b'good').hexdigest()),)
+        with tempfile.TemporaryDirectory() as td,patch.object(local_ai,'FILES',files):
+            root=Path(td); (root/'models').mkdir(); (root/'models'/'model.gguf').write_bytes(b'good')
+            progress=[]; phases=[]
+            local_ai.download(lambda done,total:progress.append((done,total)),root=root,phase=phases.append)
+            self.assertIn('驗證已存在的模型檔',phases)
+            self.assertIn((0,4),progress); self.assertIn((4,4),progress)
     def test_auth_only_for_current_local_server(self):
         class Proc:
             def poll(self): return None

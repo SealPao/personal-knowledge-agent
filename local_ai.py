@@ -42,15 +42,15 @@ def _download_file_lock(root):
             try: yield
             finally: fcntl.flock(lockfile.fileno(),fcntl.LOCK_UN)
 
-def download(progress=lambda current,total: None, cancelled=lambda: False, root=None):
+def download(progress=lambda current,total: None, cancelled=lambda: False, root=None, phase=lambda name: None):
     """Explicit, resumable download; verify the complete file before use."""
     if not _download_lock.acquire(blocking=False): raise RuntimeError('已有模型下載正在進行。')
     try:
         root=Path(root) if root else bundle_dir()
-        with _download_file_lock(root): return _download(progress,cancelled,root)
+        with _download_file_lock(root): return _download(progress,cancelled,root,phase)
     finally: _download_lock.release()
 
-def _download(progress,cancelled,root):
+def _download(progress,cancelled,root,phase=lambda name: None):
     root=Path(root) if root else bundle_dir(); folder=root/'models'; folder.mkdir(parents=True,exist_ok=True)
     total=sum(x[1] for x in FILES); done=0
     needed=0
@@ -62,22 +62,24 @@ def _download(progress,cancelled,root):
         target=folder/name
         if target.exists():
             if target.stat().st_size!=size: raise RuntimeError('現有模型檔大小不符，為避免覆寫請先移開該檔案。')
+            phase('驗證已存在的模型檔'); verified=0; progress(done,total)
             digest=hashlib.sha256()
             with target.open('rb') as existing:
                 for block in iter(lambda:existing.read(1024*1024),b''):
                     if cancelled(): raise RuntimeError('下載已取消。')
-                    digest.update(block)
+                    digest.update(block); verified+=len(block); progress(done+verified,total)
             if digest.hexdigest()!=expected: raise RuntimeError('現有模型檔驗證失敗，為避免覆寫請先移開該檔案。')
             done+=size; progress(done,total); continue
         part=folder/(name+'.download'); digest=hashlib.sha256(); count=part.stat().st_size if part.exists() else 0
         if count>size: raise RuntimeError('未完成的模型檔大小異常，請檢查並移開該檔案。')
         url='https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-gguf/resolve/'+REVISION+'/'+name
         if count:
+            phase('驗證已下載部分'); verified=0; progress(done,total)
             with part.open('rb') as existing:
                 for block in iter(lambda:existing.read(1024*1024),b''):
                     if cancelled(): raise RuntimeError('下載已取消，已保留進度。')
-                    digest.update(block)
-        progress(done+count,total)
+                    digest.update(block); verified+=len(block); progress(done+verified,total)
+        phase('下載模型'); progress(done+count,total)
         if count<size:
             request=urllib.request.Request(url,headers={'Range':f'bytes={count}-'} if count else {})
             with urllib.request.urlopen(request,timeout=60) as response:
@@ -98,6 +100,7 @@ def _download(progress,cancelled,root):
                         if count>size: raise RuntimeError('模型下載大小異常。')
                         digest.update(block); output.write(block); progress(done+count,total)
         if count!=size: raise RuntimeError('下載尚未完成；下次可繼續。')
+        phase('驗證下載完整性')
         if digest.hexdigest()!=expected:
             part.unlink(); raise RuntimeError('模型檔完整性驗證失敗，請重新下載。')
         os.replace(part,target); done+=size

@@ -45,7 +45,7 @@ class AIWindow(tk.Toplevel):
     def __init__(self,master,db_path):
         super().__init__(master); self.title('AI 問答 · 私人知識助理'); self.geometry('1080x760'); self.minsize(850,620); self.configure(bg=BG)
         self.db=Path(db_path); self.config_path=self.db.parent/'ai-settings.json'; self.config=read_config(self.config_path)
-        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running()
+        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running(); self.answer_started=None; self.download_phase='準備下載'
         self.question=tk.StringVar(); self.hint=tk.StringVar(); self._set_hint()
         head=tk.Frame(self,bg=BG); head.pack(fill='x',padx=25,pady=(20,12))
         lab(head,'與你的文件對話',bg=BG,font=(FONT,19,'bold')).pack(side='left')
@@ -58,6 +58,7 @@ class AIWindow(tk.Toplevel):
         self.download_button=btn(self,'下載可選本地模型（約 15.6 GB）',self.download_model)
         self.download_button.pack(anchor='w',padx=25,pady=(5,0))
         self.model_info=tk.StringVar(); lab(self,textvariable=self.model_info,bg=BG,fg=MUTED,font=(FONT,9)).pack(anchor='w',padx=25)
+        self.download_progress=ttk.Progressbar(self,orient='horizontal',mode='determinate',maximum=100); self.download_progress.pack(fill='x',padx=25,pady=(4,0)); self.download_progress.pack_forget()
         self.refresh_model_info()
         card=tk.Frame(self,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1); card.pack(fill='x',padx=25,pady=12)
         lab(card,'你想知道什麼？',font=(FONT,11,'bold')).pack(anchor='w',padx=15,pady=(12,4))
@@ -65,9 +66,11 @@ class AIWindow(tk.Toplevel):
         self.entry=tk.Entry(row,textvariable=self.question,font=(FONT,12),bd=0,highlightthickness=1,highlightbackground='#cbd5e1',highlightcolor=BLUE)
         self.entry.pack(side='left',fill='x',expand=True,ipady=8); self.entry.bind('<Return>',lambda e:self.prepare())
         self.ask_button=btn(row,'尋找資料並回答',self.prepare,True); self.ask_button.pack(side='left',padx=(10,0))
+        self.review_sources=tk.BooleanVar(value=False); tk.Checkbutton(card,text='回答前手動選擇來源（選用）',variable=self.review_sources,bg=WHITE,fg=MUTED,font=(FONT,9),anchor='w').pack(anchor='w',padx=15,pady=(0,8))
         bottom=tk.Frame(self,bg=BG); bottom.pack(side='bottom',fill='x',padx=25,pady=(0,15))
         self.status=tk.StringVar(value='回答會依本地搜尋結果產生，並標明來源。')
         lab(bottom,textvariable=self.status,bg=BG,fg=MUTED,anchor='w').pack(fill='x')
+        self.stop_answer_button=btn(bottom,'停止本地模型並中止回答',self.stop_local_answer)
         body=tk.PanedWindow(self,orient='horizontal',bg=BG,bd=0,sashwidth=8); body.pack(fill='both',expand=True,padx=25,pady=(0,12))
         a=tk.Frame(body,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1); s=tk.Frame(body,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1)
         body.add(a,minsize=400,stretch='always'); body.add(s,minsize=280,stretch='always')
@@ -75,7 +78,7 @@ class AIWindow(tk.Toplevel):
         f=tk.Frame(a,bg=WHITE); f.pack(fill='both',expand=True,padx=16,pady=(0,16))
         self.answer_box=tk.Text(f,wrap='word',font=(FONT,11),fg=INK,bg=WHITE,bd=0,spacing3=7)
         sb=ttk.Scrollbar(f,command=self.answer_box.yview); self.answer_box.configure(yscrollcommand=sb.set); self.answer_box.pack(side='left',fill='both',expand=True); sb.pack(side='right',fill='y')
-        self._answer_text('輸入問題後，會先顯示預計使用的資料片段；確認後才傳送給選定的 AI。')
+        self._answer_text('輸入問題後，APP 會搜尋文件並產生附來源的回答。若需事先挑選片段，可勾選上方選項。')
         lab(s,'回答所引用的來源',font=(FONT,12,'bold')).pack(anchor='w',padx=15,pady=(13,6))
         self.cites=ttk.Treeview(s,columns=('number','file','where'),show='headings',height=8,selectmode='browse')
         for key,title,width in [('number','編號',48),('file','文件',180),('where','位置',130)]: self.cites.heading(key,text=title); self.cites.column(key,width=width,minwidth=40)
@@ -91,7 +94,7 @@ class AIWindow(tk.Toplevel):
                 self.hint.set('本地 AI 模式：'+('內建模型運行中。' if local_ai.headers_for(self.config['local_base'].rstrip('/')+'/models') else '內建模型尚未啟動。'))
             else: self.hint.set('本地 AI 模式：使用自行設定的本機模型服務。')
         elif not self.config['network_enabled']: self.hint.set('外網存取已關閉。OpenAI 無法連線；本地模型仍可使用。')
-        else: self.hint.set('OpenAI 模式：確認後會將問題與選中的文件片段傳送至 OpenAI，可能產生 API 費用。')
+        else: self.hint.set('OpenAI 模式：提問時會將問題與搜尋到的文件片段傳送至 OpenAI，可能產生費用。')
     def toggle_local(self):
         if self.starting_local:
             self.start_cancel.set(); self.local_button.configure(state='disabled'); self.status.set('正在取消本地 AI 啟動…'); return
@@ -111,7 +114,7 @@ class AIWindow(tk.Toplevel):
     def refresh_model_info(self):
         try:
             info=local_ai.model_status()
-            if info['ready']: text='模型與圖片組件已就位（依檔案大小判斷）。'
+            if info['ready']: text='模型檔大小符合預期（尚未確認完整性）；按「啟動內建本地 AI」才會載入。'
             elif info['present']: text=f"模型下載進度：{info['present']/info['total']*100:.1f}%；可繼續下載。"
             else: text='尚未下載內建模型。'
             if not info['runtime']: text+=' 缺少本地執行程式。'
@@ -122,14 +125,15 @@ class AIWindow(tk.Toplevel):
             self.download_cancel.set(); self.status.set('正在取消下載…'); return
         if self.busy or local_ai.running(): return
         if not messagebox.askyesno('下載可選本地 AI','將從 Hugging Face 下載 Google Gemma 4 模型及圖片組件，約 15.6 GB，並驗證完整性。下載需要網路與足夠磁碟空間；取消或中斷後可繼續下載。確定下載嗎？',parent=self): return
-        self.downloading=True; self.download_cancel.clear(); self._set_busy(True); self.local_button.configure(state='disabled'); self.download_button.configure(text='取消模型下載'); self.status.set('正在下載本地模型…')
+        self.downloading=True; self.download_cancel.clear(); self._set_busy(True); self.local_button.configure(state='disabled'); self.download_button.configure(text='取消模型下載'); self.download_phase='準備下載或驗證'; self.download_progress['value']=0; self.download_progress.pack(fill='x',padx=25,pady=(4,0),after=self.download_button); self.model_info.set('準備下載或驗證…'); self.status.set('正在準備模型…')
         def worker():
             last=[0.0]
             def progress(done,total):
                 now=time.monotonic()
                 if now-last[0]>=1 or done==total:
                     last[0]=now; self.events.put(('download_progress',(done,total)))
-            try: local_ai.download(progress,self.download_cancel.is_set); self.events.put(('download_done',(True,'下載完成並已驗證，可啟動內建本地 AI。')))
+            def phase(name): self.events.put(('download_phase',name))
+            try: local_ai.download(progress,self.download_cancel.is_set,phase=phase); self.events.put(('download_done',(True,'下載完成並已驗證，可啟動內建本地 AI。')))
             except Exception as e: self.events.put(('download_done',(False,str(e))))
         threading.Thread(target=worker,daemon=True).start()
     def open_budget(self):
@@ -209,12 +213,12 @@ class AIWindow(tk.Toplevel):
             try: exists=bool(svc.load_key())
             except Exception as e: messagebox.showerror('無法讀取 Key',str(e),parent=self); return
             if not exists: messagebox.showinfo('請設定 API Key','請先在 AI 設定儲存 OpenAI API Key。',parent=self); return
-        self._answer_text('正在準備問題，完成後會顯示可供確認的來源片段。'); self.cites.delete(*self.cites.get_children()); self.sources_by_row=[]; self._source_text('')
-        self._set_busy(True); self.status.set('正在本地搜尋相關文件…')
+        self._answer_text('正在搜尋文件並準備回答…'); self.cites.delete(*self.cites.get_children()); self.sources_by_row=[]; self._source_text('')
+        self._set_busy(True); self.status.set('正在本地搜尋相關文件…'); approved=dict(self.config); review=self.review_sources.get()
         def work():
             try:
                 sources=svc.retrieve(str(self.db),q)
-                self.events.put(('retrieved',(q,sources)))
+                self.events.put(('retrieved',(q,sources,approved,review)))
             except Exception as e: self.events.put(('error',str(e)))
         threading.Thread(target=work,daemon=True).start()
 
@@ -247,12 +251,22 @@ class AIWindow(tk.Toplevel):
         for s in sources: text.insert('end',f'[{s["id"]}] {Path(s["path"]).name} · {s["locator"]}\n來源類型：{s.get("kind","未確認")}\n{s["excerpt"]}\n\n')
         text.configure(state='disabled'); w.protocol('WM_DELETE_WINDOW',cancel)
 
+    def stop_local_answer(self):
+        if self.answer_started is None or not local_ai.running(): return
+        self.stop_answer_button.configure(state='disabled'); self.status.set('正在停止本地模型與回答…')
+        threading.Thread(target=local_ai.stop,daemon=True).start()
+
     def send(self,w,q,sources,approved=None):
-        w.destroy(); self.status.set('正在等待模型回答…'); config=read_config(self.config_path)
+        if w is not None: w.destroy()
+        self.status.set('正在等待模型回答…'); config=read_config(self.config_path)
         if approved is not None and any(config.get(k)!=approved.get(k) for k in ('provider','local_base','openai_model','local_model','network_enabled','max_tokens')):
             self._set_busy(False); self.status.set('AI 設定已變更，未傳送資料；請重新提問並檢查預覽。'); return
         if config['provider']=='openai' and not config['network_enabled']:
             self._set_busy(False); self.status.set('外網存取已關閉，未傳送問題或片段。'); return
+        self.answer_started=time.monotonic()
+        self.answer_backend='內建本地 AI（速度取決於硬體，可能需數分鐘）' if config['provider']=='local' and config['local_model']==local_ai.MODEL else 'OpenAI' if config['provider']=='openai' else '本機模型服務'
+        if config['provider']=='local' and config['local_model']==local_ai.MODEL and local_ai.running():
+            self.stop_answer_button.configure(state='normal'); self.stop_answer_button.pack(anchor='w',pady=(4,0))
         def work():
             ticket=None
             try:
@@ -273,10 +287,14 @@ class AIWindow(tk.Toplevel):
         try:
             while True:
                 kind,value=self.events.get_nowait()
-                if kind=='retrieved': self.preview(*value)
-                elif kind=='error': self._set_busy(False); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
+                if kind=='retrieved':
+                    q,sources,approved,review=value
+                    if review: self.preview(q,sources)
+                    elif not sources: self._set_busy(False); self._answer_text('找不到可用來源，請換個問題或確認文件已匯入。'); self.status.set('沒有找到可用來源。')
+                    else: self.send(None,q,sources,approved)
+                elif kind=='error': self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._answer_text('無法完成：'+value); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
                 elif kind=='answer':
-                    text,sources,usage=value; self._set_busy(False); self._answer_text(text); self.sources_by_row=sources
+                    text,sources,usage=value; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._answer_text(text); self.sources_by_row=sources
                     self.cites.delete(*self.cites.get_children()); self._source_text('')
                     for i,s in enumerate(sources): self.cites.insert('','end',iid=str(i),values=(f'[{s["id"]}]',Path(s['path']).name,s['locator']))
                     if sources: self.cites.selection_set('0'); self.source_select()
@@ -301,12 +319,19 @@ class AIWindow(tk.Toplevel):
                     else:
                         self.status.set(result if self.start_cancel.is_set() else '本地模型啟動失敗：'+result)
                         if not self.start_cancel.is_set(): messagebox.showerror('本地模型啟動失敗',result,parent=self)
+                elif kind=='download_phase':
+                    self.download_phase=value; self.model_info.set(value+'…')
                 elif kind=='download_progress':
-                    done,total=value; self.status.set(f'下載本地模型：{done/total*100:.1f}%')
+                    done,total=value; percent=done/total*100 if total else 0; self.download_progress['value']=percent
+                    detail=f'{self.download_phase}：{percent:.1f}%（{done/1024**3:.2f} / {total/1024**3:.2f} GiB）'
+                    self.model_info.set(detail); self.status.set(detail)
                 elif kind=='download_done':
-                    ok,description=value; self.downloading=False; self._set_busy(False); self.local_button.configure(state='normal'); self.download_button.configure(text='下載可選本地模型（約 15.6 GB）'); self.status.set(description); self.refresh_model_info()
+                    ok,description=value; self.downloading=False; self._set_busy(False); self.local_button.configure(state='normal'); self.download_button.configure(text='下載可選本地模型（約 15.6 GB）'); self.download_progress.pack_forget(); self.status.set(description); self.refresh_model_info()
+                    if ok: self.model_info.set('模型完整性驗證完成；按「啟動內建本地 AI」載入。')
                     if not ok and not self.download_cancel.is_set(): messagebox.showerror('模型下載未完成',description,parent=self)
         except queue.Empty: pass
+        if self.answer_started is not None and str(self.stop_answer_button.cget('state'))!='disabled':
+            elapsed=int(time.monotonic()-self.answer_started); self.status.set(f'正在等待 {self.answer_backend}：已等待 {elapsed//60} 分 {elapsed%60:02d} 秒。')
         running=local_ai.running()
         if running!=self.last_local_running:
             self.last_local_running=running
