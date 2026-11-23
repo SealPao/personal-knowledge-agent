@@ -177,6 +177,14 @@ class LocalModelTests(unittest.TestCase):
         self.assertFalse(changed); self.assertEqual(quotes,[segments[1]])
         quotes,changed=ai_service._claim_model_anchor('PocketBook Era 和 Verse 如何關機？',[segments[1]],segments,sources)
         self.assertFalse(changed); self.assertEqual(quotes,[segments[1]])
+    def test_heading_or_irrelevant_title_does_not_become_an_answer(self):
+        sources=[{'id':1,'path':'BOOX 使用指南.html','excerpt':'BOOX 平板提供前光燈。'}]
+        def post(url,headers,payload):
+            content=json.dumps({'items':[{'text':'BOOX 使用指南 - E-INK 平板閱讀器','evidence_ids':[1]},{'text':'### AI-SAFE-ANSWER 安全回答範例','evidence_ids':[1]}]},ensure_ascii=False)
+            return {'choices':[{'message':{'content':content}}]}
+        with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
+            with self.assertRaises(ai_service.EvidenceError):
+                ai_service.answer('BOOX 前光怎麼調整',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=post)
     def test_no_claims_returns_clear_abstention(self):
         sources=[{'id':1,'excerpt':'僅有充電說明。'}]
         def post(url,headers,payload): return {'choices':[{'message':{'content':'{"items":[]}'}}]}
@@ -248,8 +256,8 @@ class LocalModelTests(unittest.TestCase):
             content=json.dumps({'answer':'按下電源鍵 [1]','citations':[1],'evidence':[{'source_id':1,'quote':'長按電源鍵，選擇關機。'}]},ensure_ascii=False)
             return {'choices':[{'message':{'content':content}}]}
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
-            text,_,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
-        self.assertIn('回答可能遺漏',text); self.assertIn('長按',text); self.assertIn('選擇',text)
+            with self.assertRaises(ai_service.EvidenceError):
+                ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
     def test_checks_relevant_sentence_even_if_model_quotes_only_part(self):
         sources=[{'id':1,'excerpt':'長按電源鍵，選擇關機。不要浸水。'}]
         missing=ai_service._missing_operation_markers('按下電源鍵並選擇關機',[(1,'電源鍵，選擇關機')],'如何關機',sources)
@@ -264,8 +272,8 @@ class LocalModelTests(unittest.TestCase):
             content=json.dumps({'answer':'來源並無記載如何關機 [1]','citations':[1],'evidence':[{'source_id':1,'quote':'裝置電源'}]},ensure_ascii=False)
             return {'choices':[{'message':{'content':content}}]}
         with patch.object(local_ai,'headers_for',return_value={'Authorization':'Bearer test'}):
-            text,_,_=ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
-        self.assertIn('來源可能包含相關操作',text)
+            with self.assertRaises(ai_service.EvidenceError):
+                ai_service.answer('如何關機',sources,'local',local_ai.MODEL,base='http://127.0.0.1:1234/v1',post=claim_response(post))
     def test_unrelated_source_does_not_trigger_missing_steps_warning(self):
         sources=[{'id':1,'excerpt':'使用前光亮度滑桿調整。'}]
         self.assertFalse(ai_service._possible_missed_steps('來源未記載重置會否刪除書籍','重置會清除書籍嗎',sources,[1]))

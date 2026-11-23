@@ -28,6 +28,18 @@ class AITests(unittest.TestCase):
         payload=ai.make_input('問題',sources)
         self.assertNotIn(str(self.source),payload); self.assertNotIn('sha256',payload)
         self.assertIn('BOOX 操作手冊.md',payload)
+    def test_specific_model_missing_does_not_fall_back_to_other_boox(self):
+        (self.source/'BOOX Palma 2.md').write_text('# BOOX 前光\nBOOX Palma 2 可在快捷選單調整前光。',encoding='utf8')
+        core.scan(str(self.source),str(self.db))
+        self.assertEqual(ai.retrieve(str(self.db),'BOOX palma3 要去哪裡調整前光？'),[])
+        self.assertEqual(ai.retrieve(str(self.db),'BOOX palma 3 要去哪裡調整前光？'),[])
+        self.assertTrue(ai.retrieve(str(self.db),'BOOX palma2 要去哪裡調整前光？'))
+    def test_followup_context_bounded_and_not_document_evidence(self):
+        history=[{'question':'BOOX palma3 前光在哪裡','answer':'之前的回答'}]
+        self.assertIn('palma3',ai.search_question('那它的亮度呢？',history))
+        self.assertEqual(ai.search_question('Kobo 如何充電',history),'Kobo 如何充電')
+        content=ai.make_input('那亮度呢？',[{'id':1,'excerpt':'測試'}],history)
+        self.assertIn('conversation_context',content); self.assertIn('之前的回答',content)
     def test_changed_source_is_not_sent(self):
         (self.source/'BOOX 操作手冊.md').write_text('來源已變更',encoding='utf-8')
         self.assertFalse(ai.retrieve(str(self.db),'BOOX Wi-Fi'))

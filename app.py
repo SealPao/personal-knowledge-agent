@@ -149,7 +149,10 @@ class App(tk.Tk):
     def open_ai(self):
         if not DB.exists(): messagebox.showinfo('尚未建立索引','請先掃描來源資料夾。'); return
         import ai_ui
-        ai_ui.AIWindow(self,DB)
+        window=getattr(self,'ai_window',None)
+        if window is None or not window.winfo_exists():
+            window=ai_ui.AIWindow(self,DB); window.return_to_main=True; self.ai_window=window
+        self.withdraw(); window.deiconify(); window.lift()
     def open_documents(self):
         if not DB.exists(): messagebox.showinfo('尚未建立索引','請先掃描來源資料夾。'); return
         import document_ui

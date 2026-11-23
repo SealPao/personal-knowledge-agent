@@ -171,12 +171,30 @@ def retrieve(db_path, question):
         kind=({'ocr':'PDF OCR 衍生文字（使用者校對，可能有誤）','table':'PDF 表格擷取（使用者校對，可能有誤）','scanned_table':'PDF 掃描表格 OCR（使用者校對，欄位可能錯置）'}.get(row[8],'PDF 衍生內容（可能有誤）')) if len(row)>9 else detail if detail in core.AI_REVIEW_STATES else '使用者知識卡' if detail=='使用者知識卡；非原始文件' else '來源文件（部分頁面擷取失敗）' if '擷取失敗' in detail else '來源文件（來源可信度未確認）'
         result.append({'id':len(result)+1,'path':path,'locator':locator,'excerpt':excerpt,'sha256':sha,'mtime_ns':mtime,'size':row[-1],'kind':kind})
         if len(result)>=MAX_SOURCES: break
+    model_tokens=[t.lower() for t in re.findall(r'(?<![a-zA-Z0-9])[a-zA-Z][a-zA-Z0-9-]*\s*\d[a-zA-Z0-9-]*(?![a-zA-Z0-9])',question) if len(t)>=4]
+    if model_tokens:
+        def has_model(source,term):
+            needle=re.sub(r'[^a-z0-9]','',term)
+            hay=re.sub(r'[^a-z0-9]','',(Path(source['path']).name+' '+source['excerpt']).lower())
+            return needle in hay
+        result=[source for source in result if all(has_model(source,term) for term in model_tokens)]
+        for i,source in enumerate(result,1): source['id']=i
     return result
 
-def make_input(question,sources):
+def make_input(question,sources,history=None):
     # Paths are deliberately not sent: IDs map back locally.
     data={'question':question,'sources':[{'id':s['id'],'kind':s.get('kind','來源文件（來源可信度未確認）'),**({'document_name':Path(s['path']).name} if s.get('path') else {}),'excerpt':s['excerpt']} for s in sources]}
+    if history: data['conversation_context']=bounded_history(history)
     return json.dumps(data,ensure_ascii=False)
+
+def bounded_history(history):
+    return [{'question':str(x.get('question',''))[:400],'answer':str(x.get('answer',''))[:900]} for x in history[-3:] if isinstance(x,dict)]
+
+def search_question(question,history):
+    q=question.strip()
+    if history and len(q)<36 and re.match(r'^(那|這|这|它|他|她|其|然後|然后|還有|还有)',q):
+        return (str(history[-1].get('question',''))[:400]+' '+q)[:MAX_QUESTION]
+    return q
 
 INSTRUCTIONS=('你是文件問答助理。只根據提供的 sources 回答，使用繁體中文。'
     '請直接整理來源實際記載並回答問題；來源可信度尚未確認時，以「文件記載」表述並提醒核對，不要因此拒絕摘要。'
@@ -237,10 +255,10 @@ def test_connection(provider,key=None,base='http://127.0.0.1:11434/v1',network_e
     except urllib.error.URLError: raise RuntimeError('無法連接服務，請檢查網路或本地服務') from None
     return len(parsed['data'])
 
-def _local_segment_input(question,sources):
+def _local_segment_input(question,sources,history=None):
     """Select verbatim sentences and neighbours; segment IDs are request-scoped."""
     segments={}; packed=[]; next_id=1
-    normalized=question.lower().replace('全畫面','全螢幕').replace('全画面','全屏幕')
+    normalized=search_question(question,history or []).lower().replace('全畫面','全螢幕').replace('全画面','全屏幕')
     terms=[]
     for token in re.findall(r'[A-Za-z0-9][A-Za-z0-9._+-]*|[\u3400-\u9fff]+',normalized):
         if re.fullmatch(r'[\u3400-\u9fff]+',token):
@@ -275,7 +293,9 @@ def _local_segment_input(question,sources):
         item={'id':source['id'],'kind':source.get('kind','來源文件（來源可信度未確認）'),'segments':selected}
         if source.get('path'): item['document_name']=Path(source['path']).name
         packed.append(item)
-    return json.dumps({'question':question,'sources':packed},ensure_ascii=False),segments
+    data={'question':question,'sources':packed}
+    if history: data['conversation_context']=bounded_history(history)
+    return json.dumps(data,ensure_ascii=False),segments
 
 
 def _checked_segment_evidence(raw,segments):
@@ -408,11 +428,11 @@ def _possible_missed_steps(body,question,sources,ids):
     action=('長按','短按','按住','按下','選擇','點選','選取','連接','開啟','滑桿','輸入','調整')
     return any(any(word in sentence for word in action) for sentence in _related_source_sentences(question,sources,set(ids)))
 
-def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434/v1',max_tokens=800,post=_post,network_enabled=False):
+def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434/v1',max_tokens=800,post=_post,network_enabled=False,history=None):
     if not sources: raise ValueError('沒有找到可用的知識來源，請換一個問題或確認文件已匯入')
     if not model.strip() or len(model)>150: raise ValueError('請設定模型名稱')
     if not 64<=int(max_tokens)<=4096: raise ValueError('輸出 Token 上限需介於 64 和 4096')
-    content=make_input(question,sources)
+    content=make_input(question,sources,history)
     if provider=='openai':
         if network_enabled is not True: raise ValueError('外網存取已關閉；請先在 AI 設定中開啟')
         if not key: raise ValueError('請先在 AI 設定中儲存 OpenAI API Key')
@@ -426,10 +446,10 @@ def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434
             raise RuntimeError('內建本地 AI 尚未啟動，請先按「啟動內建本地 AI」。')
         payload={'model':model,'messages':[{'role':'system','content':INSTRUCTIONS},{'role':'user','content':content}],'max_tokens':int(max_tokens),'stream':False}
         if model==local_ai.MODEL:
-            local_content,segments=_local_segment_input(question,sources)
+            local_content,segments=_local_segment_input(question,sources,history)
             payload['messages'][1]['content']=local_content
             payload['messages'][0]['content']=INSTRUCTIONS.replace('每項重要事實後標註 [數字]，數字只能使用提供的來源 id。','回答中不要自行加入來源編號。')
-            payload['messages'][0]['content']+=' 回傳 JSON：items 是回答中的步驟或事實陣列，每項包含 text 和 evidence_ids。每一項只寫一個步驟或事實，evidence_ids 必須填支持該項的 segment_id 整數。沒有相關資料時 items 填空陣列。不得使用未對應的片段或將不同機型的步驟混用。'
+            payload['messages'][0]['content']+=' conversation_context 僅供理解指代，舊回答可能有誤，不是證據；只根據本次 sources 回答。 回傳 JSON：items 是回答中的步驟或事實陣列，每項包含 text 和 evidence_ids。每一項只寫一個步驟或事實，evidence_ids 必須填支持該項的 segment_id 整數。沒有相關資料時 items 填空陣列。不得使用未對應的片段或將不同機型的步驟混用。'
             item_schema={'type':'object','properties':{'text':{'type':'string'},'evidence_ids':{'type':'array','items':{'type':'integer'}}},'required':['text','evidence_ids'],'additionalProperties':False}
             payload['response_format']={'type':'json_schema','schema':{'type':'object','properties':{'items':{'type':'array','items':item_schema}},'required':['items'],'additionalProperties':False}}
             payload['temperature']=0
@@ -450,13 +470,18 @@ def answer(question,sources,provider,model,key=None,base='http://127.0.0.1:11434
             for number,(body,quotes) in enumerate(claims,1):
                 quotes,model_reanchored=_claim_model_anchor(body,quotes,segments,sources)
                 quotes,reanchored=_claim_anchor(body,quotes,segments)
-                claim_ids=list(dict.fromkeys(ident for ident,_ in quotes)); ids.extend(claim_ids); all_quotes.extend(quotes)
+                claim_ids=list(dict.fromkeys(ident for ident,_ in quotes))
                 warning=_claim_warning(body,quotes)
-                lines.append(str(number)+'. '+body+' '+''.join(f'[{i}]' for i in claim_ids))
+                title_like=any(term in body for term in ('使用指南','操作手冊','使用手冊')) and not any(term in body for term in ('開啟','點選','選擇','調整','按下','長按','短按','輸入','可以','提供','需要','說明','顯示'))
+                if body.startswith('#') or title_like or body.strip().lower() in {Path(source.get('path','')).stem.lower() for source in sources} or '回答與所選原文的文字關聯較弱' in warning:
+                    continue
+                ids.extend(claim_ids); all_quotes.extend(quotes)
+                lines.append(str(len([line for line in lines if re.match(r'^\d+\.',line)])+1)+'. '+body+' '+''.join(f'[{i}]' for i in claim_ids))
                 if warning: lines.append('   ⚠ '+'；'.join(warning)+'，請核對原文。')
                 if model_reanchored: lines.append('   已依回答中的明確機型名稱調整來源，仍須確認。')
                 elif reanchored: lines.append('   已依相同文件中的原文文字調整片段，仍須確認。')
                 for ident,quote in quotes: lines.append('   原文 ['+str(ident)+']：'+quote.strip())
+            if not lines: raise EvidenceError('模型未能根據來源整理出可靠回答；請查看候選來源或換個問法。')
             body='\n'.join(x[0] for x in claims)
             missing=_missing_operation_markers(body,all_quotes,question,sources)
             alerts=[]

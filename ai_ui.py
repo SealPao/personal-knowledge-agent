@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -45,10 +46,11 @@ class AIWindow(tk.Toplevel):
     def __init__(self,master,db_path):
         super().__init__(master); self.title('AI 問答 · 私人知識助理'); self.geometry('1080x760'); self.minsize(850,620); self.configure(bg=BG)
         self.db=Path(db_path); self.config_path=self.db.parent/'ai-settings.json'; self.config=read_config(self.config_path)
-        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running(); self.answer_started=None; self.download_phase='準備下載'
+        self.events=queue.Queue(); self.busy=False; self.sources=[]; self.sources_by_row=[]; self.download_cancel=threading.Event(); self.downloading=False; self.start_cancel=threading.Event(); self.starting_local=False; self.last_local_running=local_ai.running(); self.answer_started=None; self.download_phase='準備下載'; self.history=[]; self.pending_question=''; self.last_details=''; self.return_to_main=False
         self.question=tk.StringVar(); self.hint=tk.StringVar(); self._set_hint()
         head=tk.Frame(self,bg=BG); head.pack(fill='x',padx=25,pady=(20,12))
         lab(head,'與你的文件對話',bg=BG,font=(FONT,19,'bold')).pack(side='left')
+        btn(head,'返回文件搜尋',self.close).pack(side='left',padx=12)
         btn(head,'AI 設定',self.settings).pack(side='right')
         self.local_button=btn(head,'關閉內建本地 AI' if local_ai.running() else '啟動內建本地 AI',self.toggle_local)
         self.local_button.pack(side='right',padx=8)
@@ -73,12 +75,15 @@ class AIWindow(tk.Toplevel):
         self.stop_answer_button=btn(bottom,'停止本地模型並中止回答',self.stop_local_answer)
         body=tk.PanedWindow(self,orient='horizontal',bg=BG,bd=0,sashwidth=8); body.pack(fill='both',expand=True,padx=25,pady=(0,12))
         a=tk.Frame(body,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1); s=tk.Frame(body,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1)
-        body.add(a,minsize=400,stretch='always'); body.add(s,minsize=280,stretch='always')
-        lab(a,'AI 回答',font=(FONT,12,'bold')).pack(anchor='w',padx=16,pady=(13,8))
+        body.add(a,minsize=400,stretch='always'); self.source_panel=s; self.chat_body=body; self.source_visible=False
+        aheader=tk.Frame(a,bg=WHITE); aheader.pack(fill='x',padx=16,pady=(13,8))
+        lab(aheader,'對話',font=(FONT,12,'bold')).pack(side='left')
+        btn(aheader,'顯示／隱藏來源',self.toggle_sources).pack(side='right')
+        btn(aheader,'開始新對話',self.new_chat).pack(side='right',padx=6)
         f=tk.Frame(a,bg=WHITE); f.pack(fill='both',expand=True,padx=16,pady=(0,16))
         self.answer_box=tk.Text(f,wrap='word',font=(FONT,11),fg=INK,bg=WHITE,bd=0,spacing3=7)
         sb=ttk.Scrollbar(f,command=self.answer_box.yview); self.answer_box.configure(yscrollcommand=sb.set); self.answer_box.pack(side='left',fill='both',expand=True); sb.pack(side='right',fill='y')
-        self._answer_text('輸入問題後，APP 會搜尋文件並產生附來源的回答。若需事先挑選片段，可勾選上方選項。')
+        self._answer_text('你好！你可以詢問文件中的產品或操作問題，也可以接著上一個問題追問。')
         lab(s,'回答所引用的來源',font=(FONT,12,'bold')).pack(anchor='w',padx=15,pady=(13,6))
         self.cites=ttk.Treeview(s,columns=('number','file','where'),show='headings',height=8,selectmode='browse')
         for key,title,width in [('number','編號',48),('file','文件',180),('where','位置',130)]: self.cites.heading(key,text=title); self.cites.column(key,width=width,minwidth=40)
@@ -94,7 +99,7 @@ class AIWindow(tk.Toplevel):
                 self.hint.set('本地 AI 模式：'+('內建模型運行中。' if local_ai.headers_for(self.config['local_base'].rstrip('/')+'/models') else '內建模型尚未啟動。'))
             else: self.hint.set('本地 AI 模式：使用自行設定的本機模型服務。')
         elif not self.config['network_enabled']: self.hint.set('外網存取已關閉。OpenAI 無法連線；本地模型仍可使用。')
-        else: self.hint.set('OpenAI 模式：提問時會將問題與搜尋到的文件片段傳送至 OpenAI，可能產生費用。')
+        else: self.hint.set('OpenAI 模式：提問、近期對話及搜尋片段會傳送至 OpenAI，可能產生費用。')
     def toggle_local(self):
         if self.starting_local:
             self.start_cancel.set(); self.local_button.configure(state='disabled'); self.status.set('正在取消本地 AI 啟動…'); return
@@ -114,7 +119,9 @@ class AIWindow(tk.Toplevel):
     def refresh_model_info(self):
         try:
             info=local_ai.model_status()
-            if info['ready']: text='模型檔大小符合預期（尚未確認完整性）；按「啟動內建本地 AI」才會載入。'
+            if info['ready']:
+                text='本地模型已下載（依檔案大小判斷）；按「啟動內建本地 AI」開始使用。'
+                if not self.downloading: self.download_button.configure(text='驗證已下載的本地模型')
             elif info['present']: text=f"模型下載進度：{info['present']/info['total']*100:.1f}%；可繼續下載。"
             else: text='尚未下載內建模型。'
             if not info['runtime']: text+=' 缺少本地執行程式。'
@@ -142,6 +149,22 @@ class AIWindow(tk.Toplevel):
     def open_device(self):
         import adb_ui
         adb_ui.DeviceWindow(self.master,self.db,self.question.get().strip())
+    def toggle_sources(self):
+        if self.source_visible: self.chat_body.forget(self.source_panel); self.source_visible=False
+        else: self.chat_body.add(self.source_panel,minsize=280,stretch='always'); self.source_visible=True
+    def new_chat(self):
+        if self.busy: return
+        self.history=[]; self.pending_question=''; self.last_details=''; self.sources_by_row=[]; self.cites.delete(*self.cites.get_children()); self._source_text('')
+        self._answer_text('已開始新對話。')
+    def _append_chat(self,role,value):
+        self.answer_box.configure(state='normal'); self.answer_box.insert('end','\n\n'+role+'：\n'+value); self.answer_box.see('end'); self.answer_box.configure(state='disabled')
+    @staticmethod
+    def _compact_reply(value):
+        lines=[]
+        for line in value.splitlines():
+            if line.lstrip().startswith(('原文 [','已依相同文件','已依回答中的明確機型','每項後方顯示對照原文')): continue
+            lines.append(re.sub(r'\s*\[\d+\]','',line))
+        return '\n'.join(lines).strip()
     def _answer_text(self,value):
         self.answer_box.configure(state='normal'); self.answer_box.delete('1.0','end'); self.answer_box.insert('1.0',value); self.answer_box.configure(state='disabled')
     def _source_text(self,value):
@@ -205,6 +228,10 @@ class AIWindow(tk.Toplevel):
         self.config=read_config(self.config_path); self._set_hint()
         q=self.question.get().strip()
         if not q or len(q)>svc.MAX_QUESTION: messagebox.showinfo('請輸入問題','問題不可為空，最多 2000 字。',parent=self); return
+        if re.search(r'^(你|您)(可以|能|會|会)(回答|做|幫|帮|協助|协助).{0,10}[?？]?$|^(你|您)(有什麼|有什么)功能[?？]?$',q):
+            self._append_chat('你',q); reply='我可以協助搜尋已匯入的文件、整理操作步驟並附上來源，也可以接著上一個問題追問。你可以直接問我產品、機型或操作問題。'; self._append_chat('助理',reply); self.history.append({'question':q,'answer':reply}); self.question.set(''); self.status.set('可以繼續提問。'); return
+        if q.strip(' ！!？?。') in ('你好','您好','嗨','哈囉','哈啰'):
+            reply='你好！想查詢哪個產品或操作問題？'; self._append_chat('你',q); self._append_chat('助理',reply); self.history.append({'question':q,'answer':reply}); self.question.set(''); self.status.set('可以繼續提問。'); return
         if self.config['provider']=='local' and not self.config['local_model']:
             messagebox.showinfo('請設定本地模型','請先在 AI 設定填入本地模型名稱。',parent=self); return
         if self.config['provider']=='openai':
@@ -213,11 +240,11 @@ class AIWindow(tk.Toplevel):
             try: exists=bool(svc.load_key())
             except Exception as e: messagebox.showerror('無法讀取 Key',str(e),parent=self); return
             if not exists: messagebox.showinfo('請設定 API Key','請先在 AI 設定儲存 OpenAI API Key。',parent=self); return
-        self._answer_text('正在搜尋文件並準備回答…'); self.cites.delete(*self.cites.get_children()); self.sources_by_row=[]; self._source_text('')
+        self.pending_question=q; self.last_details=''; self._append_chat('你',q); self.question.set(''); self.cites.delete(*self.cites.get_children()); self.sources_by_row=[]; self._source_text('')
         self._set_busy(True); self.status.set('正在本地搜尋相關文件…'); approved=dict(self.config); review=self.review_sources.get()
         def work():
             try:
-                sources=svc.retrieve(str(self.db),q)
+                sources=svc.retrieve(str(self.db),svc.search_question(q,self.history))
                 self.events.put(('retrieved',(q,sources,approved,review)))
             except Exception as e: self.events.put(('error',str(e)))
         threading.Thread(target=work,daemon=True).start()
@@ -229,7 +256,7 @@ class AIWindow(tk.Toplevel):
         destination='OpenAI（可能產生費用）' if self.config['provider']=='openai' else '此電腦上的本地模型服務'
         lab(w,'確認使用的資料',font=(FONT,15,'bold')).pack(anchor='w',padx=20,pady=(18,5))
         lab(w,'以下問題與片段將傳送至：'+destination,fg=MUTED).pack(anchor='w',padx=20)
-        lab(w,'勾選的檔名與片段會傳送給 AI；取消勾選的來源不會傳送。完整路徑不額外傳送，請先檢查內容。',fg=MUTED,font=(FONT,9),wraplength=800,justify='left').pack(anchor='w',padx=20,pady=(2,8))
+        lab(w,'勾選的檔名、片段及近期對話會傳送給 AI；取消勾選的來源不會傳送。完整路徑不額外傳送，請先檢查內容。',fg=MUTED,font=(FONT,9),wraplength=800,justify='left').pack(anchor='w',padx=20,pady=(2,8))
         choices=tk.Frame(w,bg=WHITE); choices.pack(fill='x',padx=20,pady=(0,4))
         selected=[]
         for source in sources:
@@ -247,6 +274,9 @@ class AIWindow(tk.Toplevel):
         text=tk.Text(preview_area,wrap='word',font=(FONT,10),fg=INK,bg='#f8fafc',bd=0,padx=12,pady=12)
         scroll=ttk.Scrollbar(preview_area,command=text.yview); text.configure(yscrollcommand=scroll.set)
         text.pack(side='left',fill='both',expand=True); scroll.pack(side='right',fill='y')
+        if self.history:
+            text.insert('end','近期對話（將與問題一同傳送）：\n')
+            for turn in svc.bounded_history(self.history): text.insert('end','你：'+turn['question']+'\n助理：'+turn['answer']+'\n\n')
         text.insert('end','問題：'+q+'\n\n')
         for s in sources: text.insert('end',f'[{s["id"]}] {Path(s["path"]).name} · {s["locator"]}\n來源類型：{s.get("kind","未確認")}\n{s["excerpt"]}\n\n')
         text.configure(state='disabled'); w.protocol('WM_DELETE_WINDOW',cancel)
@@ -272,8 +302,9 @@ class AIWindow(tk.Toplevel):
             try:
                 if any(svc.source_state(source) for source in sources): raise ValueError('來源在預覽後已變更或無法存取，未傳送；請重新掃描並提問。')
                 key=svc.load_key() if config['provider']=='openai' else None
-                if config['provider']=='openai': ticket=budget.reserve(self.db,q,sources,config['openai_model'],config['max_tokens'])
-                result=svc.answer(q,sources,config['provider'],config['openai_model'] if config['provider']=='openai' else config['local_model'],key,config['local_base'],config['max_tokens'],network_enabled=config['network_enabled'])
+                context=svc.bounded_history(getattr(self,'history',[]))
+                if config['provider']=='openai': ticket=budget.reserve(self.db,q,sources,config['openai_model'],config['max_tokens'],extra_input_tokens=len(json.dumps(context,ensure_ascii=False).encode('utf8'))+64)
+                result=svc.answer(q,sources,config['provider'],config['openai_model'] if config['provider']=='openai' else config['local_model'],key,config['local_base'],config['max_tokens'],network_enabled=config['network_enabled'],history=context)
                 if ticket: budget.finish(self.db,ticket,result[2])
                 self.events.put(('answer',result))
             except svc.EvidenceError:
@@ -292,18 +323,18 @@ class AIWindow(tk.Toplevel):
                 if kind=='retrieved':
                     q,sources,approved,review=value
                     if review: self.preview(q,sources)
-                    elif not sources: self._set_busy(False); self._answer_text('找不到可用來源，請換個問題或確認文件已匯入。'); self.status.set('沒有找到可用來源。')
+                    elif not sources: self._set_busy(False); self._append_chat('助理','找不到明確符合的資料，無法確認答案。請確認機型與文件是否已匯入，或換個問法。'); self.status.set('沒有找到可用來源。')
                     else: self.send(None,q,sources,approved)
-                elif kind=='error': self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._answer_text('無法完成：'+value); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
+                elif kind=='error': self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._append_chat('助理','無法完成：'+value); self.status.set('無法完成：'+value); messagebox.showerror('無法完成問答',value,parent=self)
                 elif kind=='unverified':
                     self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.sources_by_row=value
-                    self._answer_text('本地模型的回答未通過來源原文核對，因此未顯示該回答。右側列出搜尋到的文件供你查看；它們是候選來源，不代表已證實答案。你可以調整問題或提高 AI 設定中的輸出 Token 上限後再試。')
+                    self._append_chat('助理','目前無法根據找到的資料可靠地整理答案。可按「顯示／隱藏來源」查看候選文件，或換個問法。')
                     self.cites.delete(*self.cites.get_children()); self._source_text('')
                     for i,source in enumerate(value): self.cites.insert('','end',iid=str(i),values=(f'[{source["id"]}]',Path(source['path']).name,source['locator']))
                     if value: self.cites.selection_set('0'); self.source_select()
                     self.status.set('來源核對未通過；右側顯示搜尋到的候選來源。')
                 elif kind=='answer':
-                    text,sources,usage=value; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self._answer_text(text); self.sources_by_row=sources
+                    text,sources,usage=value; self.answer_started=None; self.stop_answer_button.pack_forget(); self._set_busy(False); self.last_details=text; reply=self._compact_reply(text); self._append_chat('助理',reply); self.history.append({'question':self.pending_question,'answer':reply}); self.history=self.history[-10:]; self.sources_by_row=sources
                     self.cites.delete(*self.cites.get_children()); self._source_text('')
                     for i,s in enumerate(sources): self.cites.insert('','end',iid=str(i),values=(f'[{s["id"]}]',Path(s['path']).name,s['locator']))
                     if sources: self.cites.selection_set('0'); self.source_select()
@@ -354,7 +385,7 @@ class AIWindow(tk.Toplevel):
         if not selected: return
         s=self.sources_by_row[int(selected[0])]
         state=svc.source_state(s)
-        self._source_text((state+'。\n' if state else '')+'來源類型：'+s.get('kind','未確認')+'\n'+s['path']+'\n'+s['locator']+'\n\n'+s['excerpt'])
+        self._source_text((state+'。\n' if state else '')+'來源類型：'+s.get('kind','未確認')+'\n'+s['path']+'\n'+s['locator']+'\n\n'+s['excerpt']+'\n\n逐項引用：\n'+getattr(self,'last_details',''))
     def open_source(self):
         selected=self.cites.selection()
         if not selected: return
@@ -366,6 +397,8 @@ class AIWindow(tk.Toplevel):
         if self.busy:
             message='請先按「取消模型下載」並等待下載停止。' if self.downloading else '請先按「取消啟動本地 AI」並等待載入停止。' if self.starting_local else '請等待搜尋或模型回應結束。'
             messagebox.showinfo('處理中',message,parent=self); return
+        if self.return_to_main:
+            self.withdraw(); self.master.deiconify(); self.master.lift(); return
         self.destroy()
     def destroy(self):
         if getattr(self,'poll_id',None):
@@ -373,3 +406,6 @@ class AIWindow(tk.Toplevel):
             except tk.TclError: pass
             self.poll_id=None
         super().destroy()
+        try:
+            if self.return_to_main and self.master.winfo_exists(): self.master.deiconify(); self.master.lift()
+        except tk.TclError: pass
