@@ -69,7 +69,7 @@ class AIWindow(tk.Toplevel):
         card=tk.Frame(self,bg=WHITE,highlightbackground='#dbe4ef',highlightthickness=1); card.pack(fill='x',padx=25,pady=12)
         lab(card,'你想知道什麼？',font=(FONT,11,'bold')).pack(anchor='w',padx=15,pady=(12,4))
         row=tk.Frame(card,bg=WHITE); row.pack(fill='x',padx=15,pady=(0,15))
-        self.entry=tk.Entry(row,textvariable=self.question,font=(FONT,12),bd=0,highlightthickness=1,highlightbackground='#cbd5e1',highlightcolor=BLUE)
+        self.entry=tk.Entry(row,textvariable=self.question,font=('Microsoft JhengHei',12),bd=0,highlightthickness=1,highlightbackground='#cbd5e1',highlightcolor=BLUE)
         self.entry.pack(side='left',fill='x',expand=True,ipady=8); self.entry.bind('<Return>',lambda e:self.prepare())
         self.ask_button=btn(row,'尋找資料並回答',self.prepare,True); self.ask_button.pack(side='left',padx=(10,0))
         opts=tk.Frame(card,bg=WHITE); opts.pack(fill='x',padx=15,pady=(0,8))
@@ -87,6 +87,7 @@ class AIWindow(tk.Toplevel):
         btn(aheader,'顯示／隱藏來源',self.toggle_sources).pack(side='right')
         btn(aheader,'開始新對話',self.new_chat).pack(side='right',padx=6)
         btn(aheader,'整理與匯出',self.open_organize).pack(side='right',padx=6)
+        btn(aheader,'複製最新回答',self.copy_answer).pack(side='right',padx=6)
         f=tk.Frame(a,bg=WHITE); f.pack(fill='both',expand=True,padx=16,pady=(0,16))
         self.answer_box=tk.Text(f,wrap='word',font=(FONT,11),fg=INK,bg=WHITE,bd=0,spacing3=7)
         sb=ttk.Scrollbar(f,command=self.answer_box.yview); self.answer_box.configure(yscrollcommand=sb.set); self.answer_box.pack(side='left',fill='both',expand=True); sb.pack(side='right',fill='y')
@@ -171,6 +172,11 @@ class AIWindow(tk.Toplevel):
         if self.busy: messagebox.showinfo('處理中','請等待目前問答完成。',parent=self); return
         import organize_ui
         organize_ui.OrganizeWindow(self,self.db,{'question':self.pending_question,'answer':self.last_answer,'outcome':self.last_outcome})
+    def copy_answer(self):
+        if not self.last_answer:
+            messagebox.showinfo('尚無回答','請先提出問題。',parent=self); return
+        self.clipboard_clear(); self.clipboard_append(self.last_answer); self.status.set('已複製最新回答，可以貼到其他地方。')
+
     def toggle_sources(self):
         if self.source_visible: self.chat_body.forget(self.source_panel); self.source_visible=False
         else: self.chat_body.add(self.source_panel,minsize=280,stretch='always'); self.source_visible=True

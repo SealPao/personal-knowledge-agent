@@ -98,7 +98,10 @@ def retrieve(db_path, question):
                 if len(part)>=2: tokens.extend(part[i:i+2] for i in range(len(part)-1))
         elif len(token)>=2: tokens.append(token)
     stop={'如何使用','如何設定','請問','什麼','如何','可以','是否','怎麼','我的','使用','這個','問題','請問我'}
-    tokens=[x for x in dict.fromkeys(tokens) if x not in stop and not any(s in x for s in ('如何','什麼','怎麼','請問'))][:24]
+    tokens=[x for x in dict.fromkeys(tokens) if x not in stop and not any(s in x for s in ('如何','什麼','怎麼','請問'))]
+    # Keep device and topic terms even when a long introductory sentence comes first.
+    priority=[x for x in tokens if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',x) or any(x in group for group in _question_topics(question))]
+    tokens=list(dict.fromkeys(priority+tokens))[:24]
     # Character variants broaden recall but do not change or translate source text.
     tokens=list(dict.fromkeys(v for token in tokens for v in core.chinese_variants(token)))[:48]
     brands=[b for b in ('boox','kobo','pubook','mooink','hyread','bigme','supernote') if b in question.lower()]

@@ -33,6 +33,7 @@ class OrganizeWindow(tk.Toplevel):
         row=tk.Frame(self,bg=WHITE);row.pack(fill='x',padx=22,pady=6)
         self.preview_button=button(row,'產生預覽',self.preview);self.preview_button.pack(side='left')
         self.save_button=button(row,'儲存預覽為 Markdown',self.save);self.save_button.pack(side='left',padx=8);self.save_button.configure(state='disabled')
+        self.copy_button=button(row,'複製預覽',self.copy_preview);self.copy_button.pack(side='left');self.copy_button.configure(state='disabled')
         self.status=tk.StringVar(value='可先填入主題，再選擇是否包含內容或使用 AI。');label(row,textvariable=self.status,fg=MUTED,wraplength=480,justify='left').pack(side='left',padx=8)
         area=tk.Frame(self,bg=WHITE);area.pack(fill='both',expand=True,padx=22,pady=(5,16))
         self.text=tk.Text(area,wrap='word',font=(FONT,10),fg=INK,bg='#f8fafc',bd=0,padx=12,pady=10)
@@ -46,7 +47,7 @@ class OrganizeWindow(tk.Toplevel):
         if use_ai and not topic:messagebox.showinfo('請輸入主題','AI 整理需要先輸入主題。',parent=self);return
         import ai_ui
         config=ai_ui.read_config(self.db.parent/'ai-settings.json'); session=dict(self.session)
-        self.busy=True;self.preview_ready=False;self.preview_button.configure(state='disabled');self.save_button.configure(state='disabled');self.status.set('正在分析索引及整理內容…')
+        self.busy=True;self.preview_ready=False;self.preview_button.configure(state='disabled');self.save_button.configure(state='disabled');self.copy_button.configure(state='disabled');self.status.set('正在分析索引及整理內容…')
         def work():
             ticket=None
             try:
@@ -85,9 +86,16 @@ class OrganizeWindow(tk.Toplevel):
                 kind,value=self.events.get_nowait();self.busy=False;self.preview_button.configure(state='normal')
                 if kind=='error':self.status.set('整理未完成：'+value);messagebox.showerror('整理未完成',value,parent=self)
                 else:
-                    self.text.delete('1.0','end');self.text.insert('1.0',value);self.preview_ready=True;self.save_button.configure(state='normal');self.status.set('請檢查並刪改預覽，再儲存。')
+                    self.text.delete('1.0','end');self.text.insert('1.0',value);self.preview_ready=True;self.save_button.configure(state='normal');self.copy_button.configure(state='normal');self.status.set('請檢查並刪改預覽，再儲存或複製。')
         except queue.Empty:pass
         if self.winfo_exists():self.poll_id=self.after(150,self.poll)
+
+    def copy_preview(self):
+        if self.busy or not self.preview_ready:return
+        text=self.text.get('1.0','end-1c')
+        if analysis_export.redact(text)!=text:
+            messagebox.showerror('疑似敏感資訊','預覽可能包含 API Key，請先移除後再複製。',parent=self);return
+        self.clipboard_clear();self.clipboard_append(text);self.status.set('已複製預覽；貼上分享前請確認內容。')
 
     def save(self):
         if self.busy or not self.preview_ready:return
